@@ -10,6 +10,7 @@ Not financial advice.
 
 import datetime
 import json
+import os
 
 import streamlit as st
 
@@ -27,10 +28,14 @@ def html(s):
 
 
 def secret(name):
+    """Streamlit Cloud Secrets, or an environment variable (Hugging Face Spaces, your own computer)."""
     try:
-        return st.secrets.get(name)
+        v = st.secrets.get(name)
+        if v:
+            return v
     except Exception:  # no secrets file
-        return None
+        pass
+    return os.environ.get(name) or None
 
 
 # ---------------------------------------------------------------- password
@@ -106,7 +111,7 @@ with st.sidebar:
     if source == "My symbols":
         typed = st.text_area("NSE symbols, comma separated", "RELIANCE, TCS, INFY, ITC, SBIN, TATASTEEL")
     shorts = st.toggle("Show SELL (short) signals", value=False)
-    auto = st.toggle("Auto-refresh every 5 minutes", value=True)
+    auto = st.toggle("Auto-refresh every 30 seconds", value=True)
     if st.button("Refresh now"):
         st.session_state["bump"] = st.session_state.get("bump", 0) + 1
     st.caption("Groww intraday charges are included in every rupee figure. Estimates: your contract note is "
@@ -133,12 +138,20 @@ def daily_data(symbols, day):
     return engine.fetch_daily(symbols)
 
 
-@st.cache_data(ttl=240, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
+def live(symbols, key):
+    try:
+        return engine.live_prices(symbols)
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
 def spark_5m(symbols, key):
     return engine.fetch_intraday_closes(symbols)
 
 
-@st.cache_data(ttl=240, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def chart(sym, key):
     try:
         return engine.fetch_chart(sym)
@@ -184,6 +197,7 @@ def took_dialog(pick):
     html(ui.rr_bar(mp["loss"], mp["gain"]))
     st.caption("Break-even \u20b9%s \u00b7 Cost %s \u00b7 Exit by 2:55 PM at the latest"
                % (ui.p2(mp["break_even"]), engine.rupees(mp["cost"])))
+    st.code(ui.order_text(pick["symbol"], pick["side"], int(qty), entry, stop, mp["target"]), language=None)
     fit = engine.size(pick["side"], entry, stop, capital, max_loss)
     if mp["loss"] > max_loss + 0.005 or mp["cost"] > capital + 0.005:
         st.warning("This is over your limits (max loss %s, capital %s). Reduce to %d shares."
@@ -199,18 +213,18 @@ def took_dialog(pick):
 
 
 @st.dialog("Sold at another price")
-def other_price_dialog(trade, price_now):
+def other_price_dialog(trade, price_now, followed=None):
     st.write("**%s**: the price you %s at." % (trade["symbol"], "sold" if trade["side"] == "buy" else "bought back"))
     price = st.number_input("Price (\u20b9)", value=float(price_now), step=0.05, format="%.2f")
     st.caption("Result after charges: %s" % engine.rupees(engine.net(trade["side"], trade["qty"], trade["entry"],
                                                                           price), True))
     if st.button("Save", type="primary", use_container_width=True):
-        close(trade, price, "other")
+        close(trade, price, "other", followed)
 
 
-def close(trade, price, how):
+def close(trade, price, how, followed=None):
     try:
-        done = journal.close_trade(trade, price, how, engine.now_ist())
+        done = journal.close_trade(trade, price, how, engine.now_ist(), followed)
     except journal.JournalError as e:
         st.error(str(e))
         return
@@ -220,15 +234,94 @@ def close(trade, price, how):
 
 # ---------------------------------------------------------------- the page
 
+def scan_market(now, day, key, key30, nifty, data):
+    """Scan the chosen stocks. Returns (picks, watch, skipped, note, scanned, checked)."""
+    syms, note = symbols_for(source, typed, day.isoformat())
+    if not syms:
+        return [], [], [], note or "empty", 0, 0   # 4th item is the note when there is no list
+    daily, _ = daily_data(tuple(syms), day.isoformat())
+    inrange = []
+    for s_ in syms:
+        m = (daily.get(s_) or {}).get("meta") or {}
+        p = m.get("regularMarketPrice")
+        if p and min_price <= p <= max_price:
+            inrange.append((-(p * (m.get("regularMarketVolume") or 0)), s_))
+    inrange = [s_ for _, s_ in sorted(inrange)][:250]
+    spark, _ = spark_5m(tuple(inrange), key) if inrange else ({}, {})
+    cands = set(engine.stage_one(spark, now, CFG))
+    cands = [s_ for s_ in inrange if s_ in cands][:25]
+    results = []
+    for s_ in cands:
+        series = chart(s_, key)
+        if not series:
+            continue
+        closes = engine.closes_before(daily.get(s_) or {}, day)
+        r = engine.analyse(s_, series, closes, nifty, now, CFG)
+        if r and r["kind"] == "pick":
+            r = engine.analyse(s_, series, closes, nifty, now, CFG, news_flag=news(s_, now.hour))
+        results.append(r)
+    traded = {t["symbol"] for t in journal.today(data, mode, day)}
+    for r in results:
+        if r and r["kind"] == "pick" and r["symbol"] in traded:
+            r.update(kind="skip", reason="You already traded it today")
+    picks, watch, skipped = engine.rank(results)
+    allpicks = [r for r in results if r and (r["kind"] == "pick" or r.get("reason") == "You already traded it today")]
+    return picks, watch, skipped, allpicks, len(inrange), len(cands)
+
+
+def track_signals(data, allpicks, now, key):
+    """Record every new signal and settle finished ones, saving once if anything changed."""
+    changed = False
+    for r in allpicks:
+        if r.get("score") is not None and r.get("qty", 0) >= 1:
+            data, c = journal.add_signal(data, r, CFG)
+            changed = changed or c
+    pending = sorted({x["symbol"] for x in data.get("signals", []) if not x.get("outcome")})[:15]
+    charts = {s_: chart(s_, key) for s_ in pending}
+    data, c = journal.settle_signals(data, {k: v for k, v in charts.items() if v}, now, CFG)
+    if changed or c:
+        save_journal(data, "Signals %s" % now.strftime("%Y-%m-%d %H:%M"))
+    return data
+
+
+def focus(t, now, key, key30, nifty, phase):
+    s_ = chart(t["symbol"], key)
+    live_p = live((t["symbol"],), key30).get(t["symbol"]) if phase == "open" else None
+    stt = engine.trade_status(t, s_, nifty, now, CFG, live=live_p)
+    html(ui.focus_tile(t, stt))
+    if stt["alert"] in ("lock", "trail", "exit", "stop", "target"):
+        html(ui.alert("lock" if stt["alert"] == "trail" else stt["alert"], stt["message"]))
+    if stt["new_stop"] is not None:
+        if st.button("Done: I moved my stop-loss to %s" % ui.p2(stt["new_stop"]), key="mv" + t["id"],
+                     type="primary", use_container_width=True):
+            save_journal(journal.replace(load_journal(), dict(t, stop=stt["new_stop"], stop_moved_at=now.replace(
+                microsecond=0).isoformat())), "Move stop %s" % t["symbol"])
+            st.rerun()
+    st.caption("How did it end?" if stt["alert"] in ("stop", "target", "exit") else "Closed it already?")
+    followed = st.toggle("I followed my rules on this trade", value=True, key="f" + t["id"])
+    b1, b2, b3 = st.columns(3)
+    if b1.button("Hit target %s" % ui.p2(t["target"]), key="t" + t["id"], use_container_width=True,
+                 type="primary" if stt["alert"] == "target" else "secondary"):
+        close(t, t["target"], "target", followed)
+    if b2.button("Hit stop-loss %s" % ui.p2(t["stop"]), key="s" + t["id"], use_container_width=True,
+                 type="primary" if stt["alert"] == "stop" else "secondary"):
+        close(t, t["stop"], "stop", followed)
+    if b3.button("Sold at another price", key="o" + t["id"], use_container_width=True,
+                 type="primary" if stt["alert"] == "exit" else "secondary"):
+        other_price_dialog(t, stt["price"], followed)
+
+
 def page():
     now = engine.now_ist()
     day = now.date()
-    key = "%s-%d-%d" % (now.strftime("%Y%m%d%H"), now.minute // 4, st.session_state.get("bump", 0))
+    bump = st.session_state.get("bump", 0)
+    key = "%s-%d" % (engine.candle_key(now), bump)                 # new candles: 20 s after each 5-minute close
+    key30 = "%s-%d" % (now.strftime("%Y%m%d%H%M") + str(now.second // 30), bump)   # live prices: every 30 s
     data = load_journal()
     phase, phase_msg = engine.market_phase(now)
 
     html('<div class="v1row"><b style="font-size:20px">&#128200; NSE scanner</b><span class="v1mut">&#8635; %s</span>'
-         '</div>' % engine.hhmm(now.time()))
+         '</div>' % now.strftime("%I:%M:%S %p").lstrip("0"))
     html('<span class="v1pill" style="background:var(--bg-b);color:var(--b)">%s</span>'
          '<span class="v1pill" style="border:1px solid var(--line)">%s capital</span>'
          '<span class="v1pill" style="border:1px solid var(--line)">Max loss %s</span>'
@@ -248,100 +341,67 @@ def page():
     if phase_msg:
         st.info(phase_msg)
 
-    # open trades first
-    opens = journal.open_trades(data, mode)
-    if opens:
-        html('<div class="v1sec">Your open trade%s</div>' % ("s" if len(opens) > 1 else ""))
-    for t in opens:
-        s = chart(t["symbol"], key)
-        stt = engine.trade_status(t, s, nifty, now, CFG)
-        html(ui.open_trade(t, stt))
-        if stt["alert"]:
-            html(ui.alert(stt["alert"], stt["message"]))
-        if stt["alert"] == "lock":
-            if st.button("Done: I moved my stop-loss to %s" % ui.p2(t["entry"]), key="lock" + t["id"]):
-                save_journal(journal.replace(data, dict(t, stop=t["entry"], stop_moved_at=now.replace(
-                    microsecond=0).isoformat())), "Move stop %s" % t["symbol"])
-                st.rerun()
-        st.caption("How did it end?" if stt["alert"] in ("stop", "target", "exit") else "Closed it already?")
-        b1, b2, b3 = st.columns(3)
-        if b1.button("Hit target %s" % ui.p2(t["target"]), key="t" + t["id"], use_container_width=True,
-                     type="primary" if stt["alert"] == "target" else "secondary"):
-            close(t, t["target"], "target")
-        if b2.button("Hit stop-loss %s" % ui.p2(t["stop"]), key="s" + t["id"], use_container_width=True,
-                     type="primary" if stt["alert"] == "stop" else "secondary"):
-            close(t, t["stop"], "stop")
-        if b3.button("Sold at another price", key="o" + t["id"], use_container_width=True,
-                     type="primary" if stt["alert"] == "exit" else "secondary"):
-            other_price_dialog(t, stt["price"])
+    picks = watch = skipped = []
+    scanned = checked = 0
+    note = ""
+    if phase in ("open", "after"):
+        with st.spinner("Updating..."):
+            picks, watch, skipped, allpicks, scanned, checked = scan_market(now, day, key, key30, nifty, data)
+            if isinstance(allpicks, str):
+                note, allpicks = allpicks, []
+            data = track_signals(load_journal(), allpicks, now, key)
 
-    # new picks
-    if phase in ("closed", "pre"):
+    opens = journal.open_trades(data, mode)
+    if opens:                                                       # focus mode: only the open trade(s)
+        for t in opens:
+            focus(t, now, key, key30, nifty, phase)
+    elif phase in ("closed", "pre", "forming"):
         pass
     elif done:
         html(ui.done_card(why, counts))
+    elif note and not scanned:
+        st.error("Could not get the stock list (%s). See README: upload the list file into trader/lists/ in the "
+                 "GitHub repository, or choose another list." % note)
     else:
-        syms, note = symbols_for(source, typed, day.isoformat())
-        if not syms:
-            st.error("Could not get the stock list (%s). See README: upload the list file into trader/lists/ "
-                     "in the GitHub repository, or choose another list." % (note or "empty"))
-        else:
-            with st.spinner("Scanning %d stocks..." % len(syms)):
-                daily, _ = daily_data(tuple(syms), day.isoformat())
-                inrange = []
-                for s in syms:
-                    m = (daily.get(s) or {}).get("meta") or {}
-                    p = m.get("regularMarketPrice")
-                    if p and min_price <= p <= max_price:
-                        inrange.append((-(p * (m.get("regularMarketVolume") or 0)), s))
-                inrange = [s for _, s in sorted(inrange)][:250]
-                spark, _ = spark_5m(tuple(inrange), key) if inrange else ({}, {})
-                cands = engine.stage_one(spark, now, CFG)
-                cands = [s for s in inrange if s in set(cands)][:25]
-                results = []
-                for s in cands:
-                    series = chart(s, key)
-                    if not series:
-                        continue
-                    closes = engine.closes_before(daily.get(s) or {}, day)
-                    r = engine.analyse(s, series, closes, nifty, now, CFG)
-                    if r and r["kind"] == "pick":
-                        r = engine.analyse(s, series, closes, nifty, now, CFG, news_flag=news(s, now.hour))
-                    results.append(r)
-                traded = {t["symbol"] for t in journal.today(data, mode, day)}
-                for r in results:
-                    if r and r["kind"] == "pick" and r["symbol"] in traded:
-                        r.update(kind="skip", reason="You already traded it today")
-                picks, watch, skipped = engine.rank(results)
-            html('<div class="v1sec">Today\'s top picks</div>')
-            if not picks:
-                st.write("No stock passes every rule right now. No signal means no trade.")
-            for k, r in enumerate(picks):
-                if k == 0:
+        if phase == "open" and watch:
+            prices = live(tuple(sorted(w["symbol"] for w in watch)), key30)
+            ready = [h for h in (engine.heads_up(w, prices.get(w["symbol"]), now, CFG) for w in watch) if h]
+            if ready:
+                html('<div class="v1sec">Breaking out right now</div>')
+                for h in ready:
+                    html(ui.heads_up_card(h))
+        html('<div class="v1sec">Today\'s top picks</div>')
+        if not picks:
+            st.write("No stock passes every rule right now. No signal means no trade.")
+        for k, r in enumerate(picks):
+            if k == 0:
+                html(ui.pick_card(r))
+            else:
+                html(ui.pick_row(r))
+                with st.expander("Details: %s" % r["symbol"]):
                     html(ui.pick_card(r))
-                else:
-                    html(ui.pick_row(r))
-                    with st.expander("Details: %s" % r["symbol"]):
-                        html(ui.pick_card(r))
-                if phase == "open" and st.button("I took this trade: %s" % r["symbol"], key="took" + r["symbol"],
-                                                 type="primary", use_container_width=True):
+            if phase == "open":
+                st.code(ui.order_text(r["symbol"], r["side"], r["qty"], r["entry"], r["stop"], r["target"]),
+                        language=None)
+                if st.button("I took this trade: %s" % r["symbol"], key="took" + r["symbol"], type="primary",
+                             use_container_width=True):
                     took_dialog(r)
-            if watch:
-                html('<div class="v1sec">Getting close</div>')
-                html(ui.watch_rows(watch))
-            with st.expander("Skipped today: %d stocks" % len(skipped)):
-                html(ui.skipped_rows(skipped) or '<span class="v1mut">None yet.</span>')
-            st.caption("Scanned %d stocks priced \u20b9%g\u2013%g from %s; %d had a full check."
-                       % (len(inrange), min_price, max_price, source, len(cands)))
+        if watch:
+            html('<div class="v1sec">Getting close</div>')
+            html(ui.watch_rows(watch))
+        with st.expander("Skipped today: %d stocks" % len(skipped)):
+            html(ui.skipped_rows(skipped) or '<span class="v1mut">None yet.</span>')
+        st.caption("Scanned %d stocks priced \u20b9%g\u2013%g from %s; %d had a full check."
+                   % (scanned, min_price, max_price, source, checked))
 
-    # results
     html('<div class="v1sec">My results (%s)</div>' % ("practice" if mode == "paper" else "real money"))
     html(ui.results_card(journal.results(data, mode), mode))
+    html(ui.signals_card(journal.signal_stats(data)))
     html('<div class="v1mut" style="text-align:center;margin-top:12px">A pick matches rules, it is not a promise. '
          'Free Yahoo data can lag. Not financial advice.</div>')
 
 
-run_every = 300 if auto else None
+run_every = 30 if auto else None
 if hasattr(st, "fragment") and run_every:
     st.fragment(run_every=run_every)(page)()
 else:

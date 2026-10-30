@@ -170,6 +170,18 @@ def hhmm(t):
     return t.strftime("%I:%M %p").lstrip("0")
 
 
+def candle_key(now, delay=20):
+    """Changes once per 5-minute candle, `delay` seconds after it closes (Yahoo needs a moment)."""
+    t = now - datetime.timedelta(seconds=delay)
+    return "%s%02d" % (t.strftime("%Y%m%d%H"), t.minute // 5)
+
+
+def candle_close(now):
+    """End of the 5-minute candle that is forming at `now` (naive IST)."""
+    start = now.replace(minute=now.minute - now.minute % 5, second=0, microsecond=0)
+    return start + BAR
+
+
 # ---------------------------------------------------------------- bars
 
 def day_bars(series, day, cutoff=None):
@@ -373,6 +385,28 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None):
     return out
 
 
+def heads_up(w, live, now, cfg=None):
+    """A 'get ready' card for a stock close to its breakout whose LIVE price is already past the
+    morning range. Nothing is confirmed until the candle closes; this only gives time to open Groww."""
+    if not w or w.get("kind") != "watch" or not live:
+        return None
+    c = dict(DEFAULTS)
+    c.update(cfg or {})
+    long = w["side"] == "buy"
+    level = w["or_high"] if long else w["or_low"]
+    if (live <= level) if long else (live >= level):
+        return None
+    if now.time() > c["no_entries_after"] or now.time() < c["no_entries_before"]:
+        return None
+    entry = snap(live)
+    stop = snap((w["or_high"] + w["or_low"]) / 2.0, "down" if long else "up", entry)
+    risk = abs(entry - stop)
+    target = snap(entry + c["reward_r"] * risk if long else entry - c["reward_r"] * risk, ref=entry)
+    qty = size(w["side"], entry, stop, c["capital"], c["max_loss"])
+    return {"symbol": w["symbol"], "side": w["side"], "live": round(live, 2), "level": level,
+            "closes_at": candle_close(now), "entry": entry, "stop": stop, "target": target, "qty": qty}
+
+
 def rank(results, limit=3):
     """(picks, watch, skipped): the best `limit` picks by score then time, watch by closeness."""
     picks = sorted([r for r in results if r and r["kind"] == "pick"],
@@ -384,11 +418,23 @@ def rank(results, limit=3):
 
 # ---------------------------------------------------------------- open trades
 
-def trade_status(trade, series, nifty, now, cfg=None):
-    """Live state of an open trade: price, P&L now, and the one alert that matters most.
+def stage_of(trade):
+    """0: stop below the buy price, 1: stop at or above it (locked), 2: stop at or past +0.5R (trailed)."""
+    long = trade["side"] == "buy"
+    entry, stop = trade["entry"], trade["stop"]
+    risk = abs(entry - trade.get("first_stop", stop)) or 0.01
+    gained = (stop - entry) if long else (entry - stop)
+    if gained < -1e-9:
+        return 0
+    return 2 if gained >= 0.5 * risk - tick_size(entry) - 1e-9 else 1   # the trail price is rounded down a tick
 
-    alert kinds: "stop", "target" (close it: which level was reached), "exit" (exit now: market drop,
-    time, square-off), "lock" (move the stop to the buy price), or None."""
+
+def trade_status(trade, series, nifty, now, cfg=None, live=None):
+    """Live state of an open trade: price, P&L, the one alert that matters most, and the Next line.
+
+    alert kinds: "stop", "target" (close it), "exit" (exit now: market drop, time, square-off),
+    "lock" (move the stop to the buy price), "trail" (move the stop to lock in half a risk), or None.
+    new_stop is the price to move the stop to, for "lock" and "trail"."""
     c = dict(DEFAULTS)
     c.update(cfg or {})
     long = trade["side"] == "buy"
@@ -401,10 +447,29 @@ def trade_status(trade, series, nifty, now, cfg=None):
     price = meta.get("regularMarketPrice") if t_day == day else None
     if price is None:
         price = since[-1]["c"] if since else (bars[-1]["c"] if bars else trade["entry"])
+    if live is not None and t_day == day:
+        price = live
     price = float(price)
     entry, stop, target = trade["entry"], trade["stop"], trade["target"]
-    risk = abs(entry - trade.get("first_stop", stop))
-    st = {"price": price, "pnl": net(trade["side"], trade["qty"], entry, price), "alert": None, "message": ""}
+    risk = abs(entry - trade.get("first_stop", stop)) or 0.01
+    stage = stage_of(trade)
+    trail_at = snap(entry + 1.5 * risk if long else entry - 1.5 * risk, ref=entry)
+    trail_to = snap(entry + 0.5 * risk if long else entry - 0.5 * risk, "down" if long else "up", entry)
+    exit_by = datetime.datetime.fromisoformat(trade["exit_by"])
+    nb = day_bars(nifty or {}, t_day, now)
+    n_at = [x for x in nb if x["start"] + BAR <= entered]
+    n_pct = pct(nb[-1]["c"], n_at[-1]["c"]) if nb and n_at else None
+    st = {"price": price, "pnl": net(trade["side"], trade["qty"], entry, price), "alert": None, "message": "",
+          "next": "Hold. Nothing to do: your stop-loss and target are set.", "stage": stage, "new_stop": None,
+          "bars": since, "trail_at": trail_at, "nifty_since": n_pct,
+          "minutes_left": max(0, int((exit_by - now).total_seconds() // 60)) if t_day == day else 0,
+          "reached_lock": False, "reached_trail": False}
+
+    def best(level):
+        return any((b["h"] >= level) if long else (b["l"] <= level) for b in since) or \
+            ((price >= level) if long else (price <= level))
+    st["reached_lock"] = best(trade["lock"])
+    st["reached_trail"] = best(trail_at)
 
     first_stop = first_target = None
     moved_at = trade.get("stop_moved_at")
@@ -419,36 +484,73 @@ def trade_status(trade, series, nifty, now, cfg=None):
     if (long and price >= target) or (not long and price <= target):
         first_target = len(since) if first_target is None else first_target
     if first_stop is not None and (first_target is None or first_stop <= first_target):
-        st.update(alert="stop", message="The price reached your stop-loss %.2f." % stop)
+        msg = "The price reached your stop-loss %.2f." % stop
+        st.update(alert="stop", message=msg, next="Record it: tap Hit stop-loss below.")
         return st
     if first_target is not None:
-        st.update(alert="target", message="The price reached your target %.2f." % target)
+        st.update(alert="target", message="The price reached your target %.2f." % target,
+                  next="Sell if it hasn't sold, then tap Hit target below.")
         return st
     if t_day < day:
         st.update(alert="exit", message="This trade is from %s. Intraday trades close the same day: "
-                  "record how it ended." % t_day.strftime("%d %b"))
+                  "record how it ended." % t_day.strftime("%d %b"), next="Record how it ended below.")
         return st
     if now.time() >= c["flat_by"]:
-        st.update(alert="exit", message="It's %s: square off now, before Groww does it for you." % hhmm(c["flat_by"]))
+        st.update(alert="exit", message="It's %s: square off now, before Groww does it for you." % hhmm(c["flat_by"]),
+                  next="Sell now at market price, then tap Sold at another price.")
         return st
-    nb = day_bars(nifty or {}, day, now)
     if len(nb) >= 4:
         move = pct(nb[-1]["c"], nb[-4]["c"])
         if move is not None and ((move <= -c["market_drop_pct"]) if long else (move >= c["market_drop_pct"])):
             st.update(alert="exit", message="Nifty %s %.1f%% in 15 minutes. Exit %s now."
-                      % ("fell" if long else "rose", abs(move), trade["symbol"]))
+                      % ("fell" if long else "rose", abs(move), trade["symbol"]),
+                      next="Exit now, then tap Sold at another price.")
             return st
-    exit_by = datetime.datetime.fromisoformat(trade["exit_by"])
     moved = (price - entry) if long else (entry - price)
     if now >= exit_by and moved < 0.5 * risk:
-        st.update(alert="exit", message="No real move since %s. Exit and free your money." % hhmm(entered.time()))
+        st.update(alert="exit", message="No real move since %s. Exit and free your money." % hhmm(entered.time()),
+                  next="Exit now, then tap Sold at another price.")
         return st
-    reached_lock = any((b["h"] >= trade["lock"]) if long else (b["l"] <= trade["lock"]) for b in since) or \
-        ((price >= trade["lock"]) if long else (price <= trade["lock"]))
-    if reached_lock and ((stop < entry) if long else (stop > entry)):
-        st.update(alert="lock", message="%s reached %.2f. Move your stop-loss to your buy price %.2f."
-                  % (trade["symbol"], trade["lock"], entry))
+    if stage == 0 and st["reached_lock"]:
+        st.update(alert="lock", new_stop=entry, message="%s reached %.2f. Move your stop-loss to your buy price %.2f."
+                  % (trade["symbol"], trade["lock"], entry),
+                  next="Move your stop-loss to %.2f (your buy price) in Groww." % entry)
+    elif stage == 1 and st["reached_trail"]:
+        st.update(alert="trail", new_stop=trail_to, message="%s reached %.2f. Move your stop-loss up to %.2f to lock "
+                  "in some profit." % (trade["symbol"], trail_at, trail_to),
+                  next="Move your stop-loss to %.2f in Groww." % trail_to)
+    elif stage >= 1:
+        st["next"] = "Hold. Your stop-loss protects you: the worst case is now %s." % \
+            rupees(net(trade["side"], trade["qty"], entry, stop), True)
     return st
+
+
+def evaluate_signal(sig, series, now, cfg=None):
+    """How a recorded signal would have ended with the simple rules: stop or target first, else the
+    time exit (no 0.5R move within the hour), else the 2:55 PM close. None while still undecided."""
+    c = dict(DEFAULTS)
+    c.update(cfg or {})
+    long = sig["side"] == "buy"
+    d = datetime.date.fromisoformat(sig["date"])
+    t0 = datetime.datetime.fromisoformat(sig["time"])
+    flat = datetime.datetime.combine(d, c["flat_by"])
+    exit_by = min(t0 + datetime.timedelta(minutes=c["time_stop_minutes"]), flat)
+    bars = [b for b in day_bars(series or {}, d, now) if b["start"] >= t0]
+    entry, stop, target = sig["entry"], sig["stop"], sig["target"]
+    risk = abs(entry - stop) or 0.01
+    for b in bars:
+        if (b["l"] <= stop) if long else (b["h"] >= stop):
+            return "stop", stop
+        if (b["h"] >= target) if long else (b["l"] <= target):
+            return "target", target
+        end = b["start"] + BAR
+        if end >= exit_by and end < flat and ((b["c"] - entry) if long else (entry - b["c"])) < 0.5 * risk:
+            return "time", b["c"]
+        if end >= flat:
+            return "close", b["c"]
+    if bars and (d < now.date() or now >= flat):
+        return "close", bars[-1]["c"]
+    return None
 
 
 # ---------------------------------------------------------------- news (Yahoo headlines)
@@ -505,6 +607,19 @@ def fetch_chart(sym, rng="5d"):
 def fetch_news(sym):
     url = "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%s&region=IN&lang=en-IN" % scan._q(scan.to_yahoo(sym))
     return scan.http_get(url, timeout=15)
+
+
+def live_prices(symbols):
+    """{SYM: last price} from one spark request per 20 symbols (Yahoo's regularMarketPrice, can lag)."""
+    if not symbols:
+        return {}
+    data, _ = scan.fetch_spark(list(symbols), "1d", "5m", 0.2)
+    out = {}
+    for sym, s in data.items():
+        p = (s.get("meta") or {}).get("regularMarketPrice")
+        if p:
+            out[sym] = float(p)
+    return out
 
 
 def closes_before(series, day):

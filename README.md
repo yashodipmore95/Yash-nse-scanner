@@ -38,6 +38,27 @@ requirements.txt          streamlit>=1.37
   your capital.
 - Day guard: after your max trades, 2 losses, or your daily loss limit, new picks pause.
 
+## While you are in a trade (focus mode)
+
+- After **I took this trade**, the page shows only that trade until you close it: live price,
+  profit or loss, a progress bar from stop to target, a live chart since your entry, and a
+  **Next** line that always says the one thing to do now.
+- Safety lock: at 1× your risk in profit, move the stop-loss to your buy price.
+- Trailing stop: at 1.5× your risk, move the stop-loss to lock in half a risk of profit.
+- Exit now: Nifty falls sharply, no real move within an hour, or 2:55 PM.
+- When it ends, tap Hit target, Hit stop-loss or Sold at another price. The "I followed my rules"
+  switch (on by default) feeds your discipline score.
+
+## What your results show
+
+- Running total after charges, win rate, average win and loss.
+- Discipline: how often you followed your rules. Slippage: your real entry versus the signal
+  price (positive means you paid more than the signal).
+- All signals: every BUY signal the scanner found while the page was open, taken or not, settled
+  with the simple rules (stop, target, time exit, 2:55 PM) at your size. After a few weeks this
+  shows whether the strategy itself works, including score 8+ versus 6–7.
+- A copy box under each pick and in the trade form has the order details for Groww.
+
 ## Update your Streamlit app (you already have one)
 
 1. Unzip this file. In your GitHub repository (`Yash-nse-scanner`), click **Add file → Upload
@@ -100,6 +121,9 @@ Tests (no internet needed): `python3 -m unittest discover -s tests`
 
 - Keep the site password-protected. Yahoo's data is for personal use, and publishing buy or sell
   calls to others can count as investment advice under SEBI's rules.
-- The page refreshes itself every 5 minutes while it is open. It cannot send phone
+- The page refreshes every 30 seconds while it is open. Live prices update every 30 seconds;
+  new candles are scanned 20 seconds after each 5-minute candle closes (9:40:20, 9:45:20 ...).
+- "Get ready" cards appear when a stock's live price crosses its morning high during a candle. It
+  only becomes a BUY if the candle closes above the high. The page cannot send phone
   notifications when it is closed.
 - Times are IST. NSE's 2026 holidays are built into `scan.py`; add 2027's when NSE publishes them.

@@ -159,6 +159,21 @@ def pick_row(r):
         % ("Buy" if long else "Sell", p2(r["entry"]), r["qty"], engine.hhmm(r["signal_time"].time()))])
 
 
+def heads_up_card(h):
+    long = h["side"] == "buy"
+    return "".join([
+        '<div class="v1card v1a"><div class="v1row"><span class="v1tag" style="background:var(--bg-a);color:var(--a)">'
+        '&#9889; Get ready</span><b style="font-size:16px">%s</b><span class="v1mut">live &#8377;%s</span></div>'
+        % (esc(h["symbol"]), p2(h["live"])),
+        '<div style="font-size:14px;margin:6px 0">Now %s its morning %s &#8377;%s. If the candle <b>closes</b> %s it at '
+        '<b>%s</b>, it becomes a %s signal.</div>'
+        % ("above" if long else "below", "high" if long else "low", p2(h["level"]), "above" if long else "below",
+           engine.hhmm(h["closes_at"].time()), "BUY" if long else "SELL"),
+        '<div class="v1mut">Get Groww ready: about %d shares, stop-loss &#8377;%s, target &#8377;%s. '
+        'Wait for the close: many breakouts fail inside the candle.</div></div>'
+        % (h["qty"], p2(h["stop"]), p2(h["target"]))])
+
+
 def watch_rows(watch):
     rows = []
     for w in watch:
@@ -257,6 +272,9 @@ def results_card(res, mode):
         '<span style="color:var(--g)">Avg win %s</span><span style="color:var(--r)">Avg loss %s</span></div>'
         % (wr, res["wins"], res["count"], engine.rupees(res["avg_win"] or 0, True),
            engine.rupees(res["avg_loss"] or 0, True)),
+        '<div class="v1mut" style="margin-top:6px">%s%s</div>'
+        % ("Followed your rules: %d%%" % res["discipline"] if res["discipline"] is not None else "",
+           (" &middot; average entry vs signal: %+.2f a share" % res["slippage"]) if res["slippage"] is not None else ""),
         '<div class="v1mut" style="margin-top:8px">%s goal: %d trades &middot; %d of %d</div>'
         % ("Practice" if mode == "paper" else "Tracking", res["goal"], res["count"], res["goal"]),
         '<div style="height:6px;border-radius:3px;background:rgba(127,127,127,.2);overflow:hidden;margin-top:4px">'
@@ -267,3 +285,118 @@ def skipped_rows(skipped):
     return "".join('<div class="v1row" style="font-size:13px;margin:3px 0"><span>%s</span><span class="v1mut">%s'
                    '</span></div>' % (esc(s["symbol"]), esc(s.get("reason") or "lower score"))
                    for s in skipped)
+
+
+def order_text(symbol, side, qty, entry, stop, target):
+    """One line to copy into Groww."""
+    return "%s | %s | Qty %d | Intraday | Limit %.2f | Stop-loss %.2f | Target %.2f" % (
+        symbol, "BUY" if side == "buy" else "SELL", qty, entry, stop, target)
+
+
+def mini_chart(t, st, w=340, h=110):
+    """Candles since entry with the stop, buy and target lines, and the live price as a dashed candle."""
+    bars = st["bars"][-30:]
+    long = t["side"] == "buy"
+    vals = [t["stop"], t["entry"], t["target"], st["price"]] + [b["h"] for b in bars] + [b["l"] for b in bars]
+    lo, hi = min(vals), max(vals)
+    pad = (hi - lo) * 0.08 or 1
+    lo, hi = lo - pad, hi + pad
+    pw = w - 50
+
+    def y(v):
+        return 4 + (hi - v) / (hi - lo) * (h - 20)
+    n = len(bars) + 1
+    step = pw / max(n, 1)
+    cw = max(2.0, min(10.0, step * 0.6))
+    out = ['<svg viewBox="0 0 %d %d" width="100%%">' % (w, h)]
+    for val, col, dash in ((t["target"], "#2e9e4f", "5 4"), (t["entry"], "currentColor", ""),
+                           (t["stop"], "#d64545", "5 4")):
+        out.append('<line x1="2" y1="%.1f" x2="%d" y2="%.1f" stroke="%s" stroke-width="1.3" stroke-dasharray="%s"/>'
+                   '<text x="%d" y="%.1f" font-size="11" fill="%s">%s</text>'
+                   % (y(val), pw, y(val), col, dash, pw + 3, y(val) + 4, col, p2(val)))
+    for k, b in enumerate(bars):
+        x = 2 + step * k + step / 2
+        col = "#2e9e4f" if b["c"] >= b["o"] else "#d64545"
+        top, bot = y(max(b["o"], b["c"])), y(min(b["o"], b["c"]))
+        out.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" stroke-width="1.2"/>'
+                   '<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="%s"/>'
+                   % (x, y(b["h"]), x, y(b["l"]), col, x - cw / 2, top, cw, max(1.0, bot - top), col))
+    x = 2 + step * len(bars) + step / 2
+    last = bars[-1]["c"] if bars else t["entry"]
+    col = "#2e9e4f" if st["price"] >= last else "#d64545"
+    top, bot = y(max(last, st["price"])), y(min(last, st["price"]))
+    out.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="none" stroke="%s" stroke-dasharray="2 2"/>'
+               % (x - cw / 2, top, cw, max(1.0, bot - top), col))
+    out.append('<text x="4" y="%d" font-size="11" fill="currentColor" opacity=".6">Since %s &middot; dashed: '
+               'candle still forming</text></svg>' % (h - 3, t["opened_at"][11:16]))
+    return "".join(out)
+
+
+def focus_tile(t, st):
+    long = t["side"] == "buy"
+    lo, hi = (t["stop"], t["target"]) if long else (t["target"], t["stop"])
+    span = (hi - lo) or 1
+    pos = max(0.0, min(1.0, (st["price"] - lo) / span))
+    red = (t["entry"] - lo) / span if long else (hi - t["entry"]) / span
+    pnl_col = "g" if st["pnl"] >= 0 else "r"
+    next_col = {"lock": "a", "trail": "a", "exit": "r", "stop": "r", "target": "g"}.get(st["alert"], "b")
+    steps = [("Bought", True), ("Lock", st["stage"] >= 1), ("Trail", st["stage"] >= 2),
+             ("Target", st["alert"] == "target")]
+    tl = []
+    for k, (name, ok) in enumerate(steps):
+        if k:
+            tl.append('<span style="flex:1;height:2px;background:%s"></span>' % ("var(--g)" if ok else "var(--line)"))
+        tl.append('<span style="color:%s">%s %s</span>' % ("var(--g)" if ok else "var(--mut)",
+                                                          "&#10003;" if ok else "&#9675;", name))
+    slip = None
+    if t.get("signal_entry"):
+        d = t["entry"] - t["signal_entry"] if long else t["signal_entry"] - t["entry"]
+        slip = "Entry vs signal: %s%.2f a share (%s)" % ("+" if d > 0 else "", d,
+                                                          "late" if d > 0 else "better" if d < 0 else "exact")
+    nifty = st.get("nifty_since")
+    left, right = ("Stop", "Target") if long else ("Target", "Stop")
+    return "".join([
+        '<div class="v1mut" style="margin:6px 0">&#127919; Focus mode &middot; new picks paused while this trade is open</div>',
+        '<div class="v1card v1b">',
+        '<div class="v1row"><b style="font-size:17px">%s%s</b><span class="v1pill" style="background:var(--bg-b);'
+        'color:var(--b)">%s &middot; %d shares</span></div>'
+        % (esc(t["symbol"]), "" if long else " (short)", "Practice" if t["mode"] == "paper" else "Real money", t["qty"]),
+        '<div class="v1row" style="margin-top:4px"><b style="font-size:24px">&#8377;%s</b>'
+        '<b style="font-size:20px;color:var(--%s)">%s</b></div>' % (p2(st["price"]), pnl_col,
+                                                                    engine.rupees(st["pnl"], True)),
+        '<div style="background:var(--bg-%s);color:var(--%s);border-radius:8px;padding:8px 10px;font-size:14px;'
+        'margin:10px 0"><b>Next:</b> %s</div>' % (next_col, next_col, esc(st["next"])),
+        '<div style="position:relative;height:12px;border-radius:6px;margin:12px 0 4px;background:linear-gradient('
+        'to right,%s 0 %.0f%%,%s %.0f%% 100%%)">'
+        % (("var(--bg-r)", red * 100, "var(--bg-g)", red * 100) if long else
+           ("var(--bg-g)", (1 - red) * 100, "var(--bg-r)", (1 - red) * 100)),
+        '<div style="position:absolute;left:calc(%.0f%% - 2px);top:-5px;width:4px;height:22px;border-radius:2px;'
+        'background:currentColor"></div></div>' % (pos * 100),
+        '<div class="v1row v1mut"><span>%s %s</span><span>Buy %s</span><span>%s %s</span></div>'
+        % (left, p2(lo), p2(t["entry"]), right, p2(hi)),
+        mini_chart(t, st),
+        '<div style="display:flex;align-items:center;gap:4px;font-size:12px;margin:8px 0">%s</div>' % "".join(tl),
+        '<div class="v1grid" style="margin-bottom:6px"><div><span class="v1mut">Time exit</span><br><b>%s</b></div>'
+        '<div><span class="v1mut">Nifty since entry</span><br><b style="color:var(--%s)">%s</b></div></div>'
+        % ("%d min left" % st["minutes_left"] if st["minutes_left"] else "now",
+           "g" if (nifty or 0) >= 0 else "r", ("%+.2f%%" % nifty) if nifty is not None else "-"),
+        '<div class="v1mut">Stop-loss now &#8377;%s%s</div>' % (p2(t["stop"]), (" &middot; " + slip) if slip else ""),
+        '</div>'])
+
+
+def signals_card(ss):
+    if not ss["count"]:
+        return ('<div class="v1card"><div class="v1mut">Every BUY signal is tracked in the background (taken or '
+                'not) while this page is open. Stats appear after the first ones finish%s.</div></div>'
+                % (" (%d waiting)" % ss["pending"] if ss["pending"] else ""))
+
+    def part(name, pair):
+        n, w = pair
+        return "%s: %s" % (name, "%d%% of %d" % (w, n) if n else "none yet")
+    return ('<div class="v1card"><div class="v1row"><span class="v1mut">All signals (simple rules, your size)</span>'
+            '<b style="color:var(--%s)">%s</b></div><div style="font-size:13px;margin-top:4px">%d signals &middot; '
+            'win rate %d%% &middot; average %s</div><div class="v1mut" style="margin-top:4px">%s &middot; %s'
+            '%s</div></div>'
+            % ("g" if ss["total"] >= 0 else "r", engine.rupees(ss["total"], True), ss["count"], ss["win_rate"] or 0,
+               engine.rupees(ss["avg"] or 0, True), part("Score 8+", ss["strong"]), part("Score 6-7", ss["normal"]),
+               (" &middot; %d still running" % ss["pending"]) if ss["pending"] else ""))

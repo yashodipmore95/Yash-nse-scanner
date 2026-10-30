@@ -101,7 +101,17 @@ def new_trade(pick_or_symbol, side, entry, stop, qty, mode, now, cfg=None):
             "opened_at": now.replace(microsecond=0).isoformat(), "entry": round(entry, 2), "stop": round(stop, 2),
             "first_stop": round(stop, 2), "qty": qty, "target": plan["target"], "lock": plan["lock"],
             "exit_by": exit_by.replace(microsecond=0).isoformat(), "status": "open",
-            "score": None if isinstance(pick_or_symbol, str) else pick_or_symbol.get("score")}
+            "score": None if isinstance(pick_or_symbol, str) else pick_or_symbol.get("score"),
+            "signal_entry": None if isinstance(pick_or_symbol, str) else pick_or_symbol.get("entry")}
+
+
+def slippage(trade):
+    """Rupees per share paid versus the signal price (positive = worse than the signal), or None."""
+    sig = trade.get("signal_entry")
+    if not sig:
+        return None
+    d = trade["entry"] - sig if trade["side"] == "buy" else sig - trade["entry"]
+    return round(d, 2)
 
 
 def levels(side, entry, stop, cfg=None):
@@ -121,7 +131,7 @@ def money_plan(side, entry, stop, qty, cfg=None):
                 break_even=engine.break_even(side, qty, entry), cost=round(qty * entry, 2))
 
 
-def close_trade(trade, exit_price, how, now):
+def close_trade(trade, exit_price, how, now, followed=None):
     try:
         exit_price = float(exit_price)
     except (TypeError, ValueError):
@@ -129,7 +139,7 @@ def close_trade(trade, exit_price, how, now):
     if exit_price <= 0:
         raise JournalError("Enter the price you sold at.")
     trade = dict(trade)
-    trade.update(status="closed", exit=round(exit_price, 2), how=how,
+    trade.update(status="closed", exit=round(exit_price, 2), how=how, followed=followed,
                  closed_at=now.replace(microsecond=0).isoformat(),
                  net=engine.net(trade["side"], trade["qty"], trade["entry"], exit_price))
     return trade
@@ -177,6 +187,8 @@ def guard(data, mode, day, cfg=None):
 
 def results(data, mode, goal=50):
     closed = closed_trades(data, mode)
+    asked = [t for t in closed if t.get("followed") is not None]
+    slips = [slippage(t) for t in closed if slippage(t) is not None]
     running, total = [], 0.0
     for t in closed:
         total += t["net"]
@@ -188,4 +200,54 @@ def results(data, mode, goal=50):
             "wins": len(wins), "losses": len(losses),
             "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
             "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
-            "goal": goal}
+            "goal": goal,
+            "discipline": round(100.0 * sum(1 for t in asked if t["followed"]) / len(asked)) if asked else None,
+            "slippage": round(sum(slips) / len(slips), 2) if slips else None}
+
+
+# ---------------------------------------------------------------- every signal, tracked in the background
+
+def add_signal(data, pick, cfg=None):
+    """Record a BUY / SELL signal once (symbol + day), sized to today's settings. -> (data, changed)."""
+    sigs = data.get("signals", [])
+    day = pick["signal_time"].date().isoformat()
+    if any(x["symbol"] == pick["symbol"] and x["date"] == day for x in sigs):
+        return data, False
+    rec = {"symbol": pick["symbol"], "side": pick["side"], "date": day,
+           "time": pick["signal_time"].replace(microsecond=0).isoformat(), "score": pick["score"],
+           "entry": pick["entry"], "stop": pick["stop"], "target": pick["target"], "qty": pick["qty"],
+           "outcome": None, "exit": None, "net": None}
+    data = dict(data)
+    data["signals"] = sigs + [rec]
+    return data, True
+
+
+def settle_signals(data, charts, now, cfg=None):
+    """Fill in the outcome of open signals from `charts` {symbol: series}. -> (data, changed)."""
+    changed = False
+    out = []
+    for x in data.get("signals", []):
+        if x.get("outcome") is None and x["symbol"] in charts:
+            res = engine.evaluate_signal(x, charts[x["symbol"]], now, cfg)
+            if res:
+                x = dict(x, outcome=res[0], exit=round(res[1], 2),
+                         net=engine.net(x["side"], max(x["qty"], 1), x["entry"], res[1]))
+                changed = True
+        out.append(x)
+    if changed:
+        data = dict(data)
+        data["signals"] = out
+    return data, changed
+
+
+def signal_stats(data):
+    done = [x for x in data.get("signals", []) if x.get("outcome")]
+
+    def wr(xs):
+        return round(100.0 * sum(1 for x in xs if x["net"] > 0) / len(xs)) if xs else None
+    strong = [x for x in done if x["score"] >= 8]
+    normal = [x for x in done if x["score"] < 8]
+    return {"count": len(done), "pending": sum(1 for x in data.get("signals", []) if not x.get("outcome")),
+            "win_rate": wr(done), "total": round(sum(x["net"] for x in done), 2),
+            "avg": round(sum(x["net"] for x in done) / len(done), 2) if done else None,
+            "strong": (len(strong), wr(strong)), "normal": (len(normal), wr(normal))}
