@@ -130,7 +130,8 @@ def pick_card(r):
         % (col, col, arrow, tag, esc(r["symbol"]), engine.hhmm(r["signal_time"].time())),
         '<div style="display:flex;align-items:center;gap:10px;margin:8px 0">%s<div style="flex:1">%s</div></div>'
         % (ring(r["score"]), factor_bars(r["factors"])),
-        '<div>%s</div>' % chips(r["checks"]),
+        '<div>%s%s</div>' % (chips(r["checks"]), sector_chip(r)),
+        ('<div style="font-size:13px;margin:6px 0">%s</div>' % esc(r["why"])) if r.get("why") else "",
         chart(r),
         rr_bar(r["loss_at_stop"], r["gain_at_target"]),
         '<div class="v1mut" style="margin-bottom:8px">%s %d shares at &#8377;%s &middot; Intraday &middot; Limit '
@@ -146,6 +147,84 @@ def pick_card(r):
         '<div class="v1mut" style="margin-top:8px">Before you %s: results or big news today? calm? stop-loss ready?</div>'
         % ("buy" if long else "sell"),
         '</div>'])
+
+
+def sector_chip(r):
+    sec = r.get("sector")
+    if not sec or sec[1] is None:
+        return ""
+    good = (sec[1] > 0) if r["side"] == "buy" else (sec[1] < 0)
+    col = "g" if good else "r"
+    return ('<span class="v1pill" style="background:var(--bg-%s);color:var(--%s)">%s Sector %s (%s %+.1f%%)</span>'
+            % (col, col, "&#10003;" if good else "&#10007;", "strong" if good else "weak", esc(sec[0]), sec[1]))
+
+
+def sector_tiles(sectors):
+    if not sectors:
+        return ""
+    cells = []
+    for name, chg in sorted(sectors.items(), key=lambda kv: -kv[1]):
+        a = min(abs(chg) / 1.5, 1.0)
+        if chg > 0.05:
+            bg, fg = "rgba(46,158,79,%.2f)" % (0.15 + 0.6 * a), "inherit"
+        elif chg < -0.05:
+            bg, fg = "rgba(214,69,69,%.2f)" % (0.15 + 0.6 * a), "inherit"
+        else:
+            bg, fg = "var(--card)", "inherit"
+        cells.append('<div style="background:%s;color:%s;border:1px solid var(--line);border-radius:8px;padding:6px 2px;'
+                     'text-align:center"><div style="font-size:12px;font-weight:600">%s</div><div style="font-size:12px">'
+                     '%+.1f%%</div></div>' % (bg, fg, esc(name), chg))
+    return ('<div class="v1sec">Sectors today</div><div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));'
+            'gap:6px">%s</div>' % "".join(cells))
+
+
+def breadth_bar(up, down):
+    if up + down == 0:
+        return ""
+    share = 100.0 * up / (up + down)
+    mood = ("Strong day" if share >= 65 else "Weak day" if share <= 35 else "Mixed day")
+    col = "g" if share >= 65 else "r" if share <= 35 else "a"
+    return ('<div class="v1sec">Market breadth (your scanned stocks)</div><div class="v1bar">'
+            '<div style="flex:%d;background:var(--bg-g);color:var(--g);font-weight:600;justify-content:flex-start;'
+            'padding-left:8px">%d up</div><div style="flex:%d;background:var(--bg-r);color:var(--r);'
+            'justify-content:flex-end;padding-right:8px">%d down</div></div>'
+            '<div style="font-size:12px;color:var(--%s)">%s: %d%% of stocks are up</div>'
+            % (max(up, 1), up, max(down, 1), down, col, mood, round(share)))
+
+
+def refresh_badge(seconds, focus=False):
+    if seconds is None:
+        return '<span class="v1pill" style="border:1px solid var(--line)">&#9208; refresh off</span>'
+    if focus:
+        return '<span class="v1pill" style="border:1px solid var(--line)">panel only &middot; %d s</span>' % seconds
+    return ('<span class="v1pill" style="background:var(--bg-g);color:var(--g)">&#8635; %d s</span>' % seconds)
+
+
+def readiness_card(ready):
+    rows = "".join('<div class="v1row" style="font-size:13px;margin:3px 0"><span>%s %s</span><span class="v1mut">%s'
+                   '</span></div>' % ('<span style="color:var(--g)">&#10003;</span>' if ok else
+                                       '<span class="v1mut">&#9675;</span>', esc(name), esc(val))
+                   for name, ok, val in ready["goals"])
+    done = ready["done"]
+    msg = ("All 4 goals met: you can consider real money, starting small." if done == 4 else
+           "%d of 4 goals met. Keep practising." % done)
+    return ('<div class="v1card"><div class="v1row"><b>Ready for real money?</b><b style="color:var(--%s)">%d of 4</b>'
+            '</div>%s<div class="v1mut" style="margin-top:6px">%s</div></div>'
+            % ("g" if done == 4 else "a" if done >= 2 else "r", done, rows, msg))
+
+
+def lab_card(rows):
+    if not any(y[0] or n[0] for _, _, y, n in rows):
+        return ""
+
+    def cell(pair):
+        n, w = pair
+        return "%d%% of %d" % (w, n) if n else "no data yet"
+    body = "".join('<div style="font-size:12px;margin:4px 0"><b>%s</b>: %s <span class="v1mut">&middot; %s: %s</span>'
+                   '</div>' % (esc(y_lab), cell(y), esc(n_lab), cell(n)) for y_lab, n_lab, y, n in rows)
+    return ('<div class="v1card"><div class="v1row"><b>Filter lab</b><span class="v1mut">win rate of all signals'
+            '</span></div>%s<div class="v1mut" style="margin-top:4px">After 3&ndash;4 weeks, a clear gap shows which '
+            'extra rule is worth turning on.</div></div>' % body)
 
 
 def pick_row(r):
@@ -272,13 +351,40 @@ def results_card(res, mode):
         '<span style="color:var(--g)">Avg win %s</span><span style="color:var(--r)">Avg loss %s</span></div>'
         % (wr, res["wins"], res["count"], engine.rupees(res["avg_win"] or 0, True),
            engine.rupees(res["avg_loss"] or 0, True)),
-        '<div class="v1mut" style="margin-top:6px">%s%s</div>'
+        '<div class="v1mut" style="margin-top:6px">%s%s%s</div>'
         % ("Followed your rules: %d%%" % res["discipline"] if res["discipline"] is not None else "",
+           (" &middot; most common mistake: %s (%d)" % (esc(res["mistake"][0]), res["mistake"][1]))
+           if res.get("mistake") else "",
            (" &middot; average entry vs signal: %+.2f a share" % res["slippage"]) if res["slippage"] is not None else ""),
         '<div class="v1mut" style="margin-top:8px">%s goal: %d trades &middot; %d of %d</div>'
         % ("Practice" if mode == "paper" else "Tracking", res["goal"], res["count"], res["goal"]),
         '<div style="height:6px;border-radius:3px;background:rgba(127,127,127,.2);overflow:hidden;margin-top:4px">'
         '<div style="width:%d%%;height:100%%;background:var(--b)"></div></div></div>' % goal])
+
+
+def finished_rows(finished):
+    """Breakouts already decided today: time, score at the time, would the scanner have taken it, result."""
+    if not finished:
+        return ""
+    tgt = [r for r in finished if r["outcome"] == "target"]
+    stp = [r for r in finished if r["outcome"] == "stop"]
+    valid = [r for r in finished if r.get("signal_valid")]
+    vt = sum(1 for r in valid if r["outcome"] == "target")
+    head = ('<div class="v1mut" style="margin-bottom:6px">%d hit target &middot; %d hit stop. Signals the scanner '
+            'would have taken: %s.</div>'
+            % (len(tgt), len(stp), ("%d of %d hit target" % (vt, len(valid))) if valid else "none"))
+    rows = []
+    for r in sorted(finished, key=lambda r: r["signal_time"]):
+        ok = r["outcome"] == "target"
+        took = r.get("signal_valid")
+        rows.append('<div style="font-size:13px;margin:5px 0;border-bottom:1px solid var(--line);padding-bottom:4px">'
+                    '<div class="v1row"><b>%s</b><span style="color:var(--%s)">%s</span></div>'
+                    '<div class="v1mut">%s &middot; score %d &middot; %s</div></div>'
+                    % (esc(r["symbol"]), "g" if ok else "r", "hit target &#10003;" if ok else "fell back to stop &#10007;",
+                       engine.hhmm(r["signal_time"].time()), r["score"],
+                       "scanner would have taken it" if took else "scanner would have skipped: %s"
+                       % esc(r.get("signal_reason") or "")))
+    return head + "".join(rows)
 
 
 def skipped_rows(skipped):

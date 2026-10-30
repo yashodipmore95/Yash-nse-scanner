@@ -131,7 +131,10 @@ def money_plan(side, entry, stop, qty, cfg=None):
                 break_even=engine.break_even(side, qty, entry), cost=round(qty * entry, 2))
 
 
-def close_trade(trade, exit_price, how, now, followed=None):
+TAGS = ["Followed plan", "Entered late", "Moved stop-loss", "Exited early", "Skipped stop-loss", "Other mistake"]
+
+
+def close_trade(trade, exit_price, how, now, followed=None, tag=None):
     try:
         exit_price = float(exit_price)
     except (TypeError, ValueError):
@@ -139,7 +142,9 @@ def close_trade(trade, exit_price, how, now, followed=None):
     if exit_price <= 0:
         raise JournalError("Enter the price you sold at.")
     trade = dict(trade)
-    trade.update(status="closed", exit=round(exit_price, 2), how=how, followed=followed,
+    if tag:
+        followed = tag == "Followed plan"
+    trade.update(status="closed", exit=round(exit_price, 2), how=how, followed=followed, tag=tag,
                  closed_at=now.replace(microsecond=0).isoformat(),
                  net=engine.net(trade["side"], trade["qty"], trade["entry"], exit_price))
     return trade
@@ -202,7 +207,33 @@ def results(data, mode, goal=50):
             "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
             "goal": goal,
             "discipline": round(100.0 * sum(1 for t in asked if t["followed"]) / len(asked)) if asked else None,
-            "slippage": round(sum(slips) / len(slips), 2) if slips else None}
+            "slippage": round(sum(slips) / len(slips), 2) if slips else None,
+            "mistake": _top_mistake(closed), "ready": readiness(closed, total, asked, goal)}
+
+
+def _top_mistake(closed):
+    counts = {}
+    for t in closed:
+        tg = t.get("tag")
+        if tg and tg != "Followed plan":
+            counts[tg] = counts.get(tg, 0) + 1
+    if not counts:
+        return None
+    tg = max(sorted(counts), key=lambda k: counts[k])
+    return tg, counts[tg]
+
+
+def readiness(closed, total, asked, goal=50):
+    """The four goals before real money: enough trades, a positive total, 50%+ wins, rules 90%+."""
+    n = len(closed)
+    wins = sum(1 for t in closed if t["net"] > 0)
+    wr = 100.0 * wins / n if n else 0
+    disc = 100.0 * sum(1 for t in asked if t["followed"]) / len(asked) if asked else 0
+    goals = [("%d practice trades" % goal, n >= goal, "%d of %d" % (n, goal)),
+             ("Positive total after charges", n > 0 and total > 0, engine.rupees(total, True)),
+             ("Win rate 50% or more", n > 0 and wr >= 50, "%d%%" % round(wr)),
+             ("Followed rules 90%+", bool(asked) and disc >= 90, "%d%%" % round(disc))]
+    return {"goals": goals, "done": sum(1 for _, ok, _ in goals if ok)}
 
 
 # ---------------------------------------------------------------- every signal, tracked in the background
@@ -216,7 +247,7 @@ def add_signal(data, pick, cfg=None):
     rec = {"symbol": pick["symbol"], "side": pick["side"], "date": day,
            "time": pick["signal_time"].replace(microsecond=0).isoformat(), "score": pick["score"],
            "entry": pick["entry"], "stop": pick["stop"], "target": pick["target"], "qty": pick["qty"],
-           "outcome": None, "exit": None, "net": None}
+           "outcome": None, "exit": None, "net": None, "lab": pick.get("lab") or {}}
     data = dict(data)
     data["signals"] = sigs + [rec]
     return data, True
@@ -251,3 +282,22 @@ def signal_stats(data):
             "win_rate": wr(done), "total": round(sum(x["net"] for x in done), 2),
             "avg": round(sum(x["net"] for x in done) / len(done), 2) if done else None,
             "strong": (len(strong), wr(strong)), "normal": (len(normal), wr(normal))}
+
+
+LAB = [("before_11", "Breakout before 11 AM", "after 11 AM"), ("in_play", "In play (2\u00d7 volume)", "normal volume"),
+       ("trend_rising", "20-day average rising", "not rising"), ("sector_up", "Sector moving the same way", "sector not")]
+
+
+def lab_stats(data):
+    """Win rate of settled signals with and without each recorded condition: [(label, yes, no)], each side
+    (count, win rate or None)."""
+    done = [x for x in data.get("signals", []) if x.get("outcome")]
+    out = []
+    for key, yes_label, no_label in LAB:
+        yes = [x for x in done if (x.get("lab") or {}).get(key) is True]
+        no = [x for x in done if (x.get("lab") or {}).get(key) is False]
+
+        def wr(xs):
+            return (len(xs), round(100.0 * sum(1 for x in xs if x["net"] > 0) / len(xs)) if xs else None)
+        out.append((yes_label, no_label, wr(yes), wr(no)))
+    return out

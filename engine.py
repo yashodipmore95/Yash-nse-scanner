@@ -44,15 +44,34 @@ DEFAULTS = {
     "market_drop_pct": 0.4,
 }
 
-FACTORS = [  # key, label on the card, points
+FACTORS = [  # key, label on the card, points (13 in all, shown as a score out of 10)
     ("breakout", "Breakout", 2),
     ("volume", "Buying power", 2),
+    ("inplay", "In play", 2),
     ("vwap", "Buyers in control", 1),
     ("relative", "Beats market", 2),
     ("trend", "Trend", 1),
     ("room", "Room to move", 1),
     ("market", "Market okay", 1),
+    ("early", "Early breakout", 1),
 ]
+RAW_MAX = sum(p for _, _, p in FACTORS)
+
+SECTORS = [("Bank", "^NSEBANK"), ("IT", "^CNXIT"), ("Auto", "^CNXAUTO"), ("Pharma", "^CNXPHARMA"),
+           ("Metal", "^CNXMETAL"), ("FMCG", "^CNXFMCG"), ("Energy", "^CNXENERGY"), ("Realty", "^CNXREALTY")]
+INDUSTRY_SECTOR = [  # NSE industry name (Nifty 500 list) -> sector tile
+    ("financial", "Bank"), ("bank", "Bank"), ("information technology", "IT"), ("automobile", "Auto"),
+    ("healthcare", "Pharma"), ("pharma", "Pharma"), ("metal", "Metal"), ("fast moving consumer", "FMCG"),
+    ("oil", "Energy"), ("power", "Energy"), ("energy", "Energy"), ("realty", "Realty"),
+]
+
+
+def sector_of(industry):
+    low = (industry or "").lower()
+    for key, name in INDUSTRY_SECTOR:
+        if key in low:
+            return name
+    return None
 WEAK_REASON = {
     "breakout": "weak breakout candle",
     "volume": "weak buying",
@@ -64,6 +83,8 @@ WEAK_REASON = {
 }
 WEAK_REASON_SHORT = dict(WEAK_REASON, volume="weak selling", vwap="above the day's average price",
                          relative="stronger than the market", room="support just below", market="market rising")
+DEFAULTS.update({"range_min": 0.25, "range_max": 1.2, "early_until": datetime.time(11, 0),
+                 "strong_only_after": datetime.time(13, 0)})
 
 
 # ---------------------------------------------------------------- money and ticks
@@ -235,9 +256,60 @@ def pct(a, b):
     return (a / b - 1.0) * 100.0 if a and b else None
 
 
+def daily_ohlc(series, day):
+    """[(date, high, low, close, volume)] of full sessions before `day`, from a daily v8 chart."""
+    out = []
+    series = series or {}
+    t = series.get("t") or []
+    col = {k: (series.get(k) or [None] * len(t)) for k in ("h", "l", "c", "v")}
+    for k, ts in enumerate(t):
+        if ts is None:
+            continue
+        d = scan.ts_to_ist(ts).date()
+        h, l, c = col["h"][k], col["l"][k], col["c"][k]
+        if d < day and None not in (h, l, c):
+            out.append((d, float(h), float(l), float(c), col["v"][k]))
+    return out
+
+
+def atr(rows, n=14):
+    """Average true range of the last n sessions from daily_ohlc rows, or None."""
+    if len(rows) < n + 1:
+        return None
+    trs = []
+    for k in range(len(rows) - n, len(rows)):
+        _, h, l, _, _ = rows[k]
+        pc = rows[k - 1][3]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs) / n
+
+
+def sma_rising(closes, n=20, back=5):
+    """True when the n-day average today is above where it was `back` sessions ago (None if too short)."""
+    if len(closes) < n + back:
+        return None
+    return sum(closes[-n:]) / n > sum(closes[-n - back:-back]) / n
+
+
+def relative_volume(series, day, upto):
+    """Today's volume up to and including the bar starting at `upto`, against the average of earlier
+    days in the series up to the same time of day. None without earlier days."""
+    days = sorted({scan.ts_to_ist(ts).date() for ts in (series.get("t") or []) if ts})
+    t_end = upto.time()
+
+    def cum(d):
+        return sum(b["v"] or 0 for b in day_bars(series, d) if b["start"].time() <= t_end)
+    today = cum(day)
+    past = [cum(d) for d in days if d < day]
+    past = [x for x in past if x > 0]
+    if not past or not today:
+        return None
+    return today / (sum(past) / len(past))
+
+
 # ---------------------------------------------------------------- the analysis
 
-def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None):
+def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_chart=None, sector=None):
     """One stock -> a result dict, or None when there is nothing to show.
 
     series  Yahoo v8 5-minute bars, a few days (today and yesterday)
@@ -245,6 +317,8 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None):
     nifty   Yahoo v8 5-minute bars for ^NSEI, same days
     now     naive IST datetime
     news_flag  None (not checked), "" (nothing found) or a short reason (results, board meeting...)
+    daily_chart  Yahoo v8 daily bars (3 months) for the range-size check (ATR); optional
+    sector     (name, % move today) of the stock's sector index, for the filter lab; optional
 
     result kind: "pick" (a BUY / SELL that passed), "skip" (a breakout that failed a check or scored
     under 6, with the reason), "watch" (no breakout yet, close to it)."""
@@ -329,8 +403,16 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None):
     else:
         pts["room"] = 1 if (y_low is None or y_low >= entry or y_low <= target) else 0
     pts["market"] = 1 if (n_chg is not None and ((n_chg >= 0) if long else (n_chg <= 0))) else 0
-    score = sum(pts.values())
+    rv = relative_volume(series, day, b["start"])
+    pts["inplay"] = 2 if rv and rv >= 2.0 else 1 if rv and rv >= 1.3 else 0
+    pts["early"] = 1 if when.time() <= c["early_until"] else 0
+    raw = sum(pts.values())
+    score = int(math.floor(raw * 10.0 / RAW_MAX + 0.5))
     factors = [(k, label, pts[k], mx) for k, label, mx in FACTORS]
+    rows = daily_ohlc(daily_chart, day) if daily_chart else []
+    a14 = atr(rows)
+    range_ratio = (or_high - or_low) / a14 if a14 else None
+    edge_pct = round(edge, 2) if (s_chg is not None and n_chg is not None) else None
 
     # hard checks, in the order a trader reads them
     gap = pct(bars[0]["o"], prev_close)
@@ -350,6 +432,13 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None):
     elif too_far:
         reason = reason or ("Opened with a big gap" if gap is not None and abs(gap) > c["max_gap_pct"]
                             else "Already moved more than %g%% today" % c["max_extended_pct"])
+    if range_ratio is not None:
+        okr = c["range_min"] <= range_ratio <= c["range_max"]
+        checks.append(("range", "Range size okay", okr))
+        if not okr:
+            reason = reason or ("Morning range too wide (%.1f\u00d7 its normal daily move)" % range_ratio
+                                if range_ratio > c["range_max"] else
+                                "Morning range too tiny (%.2f\u00d7 its normal daily move)" % range_ratio)
     fits = qty >= 1 and c["min_price"] <= entry <= c["max_price"]
     checks.append(("money", "Fits your money", fits))
     if not fits:
@@ -357,31 +446,80 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None):
                             if not (c["min_price"] <= entry <= c["max_price"]) else "Too risky for your capital")
     if risk < entry * 0.0005:
         reason = reason or "Stop too close to the entry"
-    # where is the price now?
-    after = bars[i + 1:]
-    if after:
-        hit_stop = any((x["l"] <= stop) if long else (x["h"] >= stop) for x in after)
-        hit_target = any((x["h"] >= target) if long else (x["l"] <= target) for x in after)
-        if hit_stop:
-            reason = reason or "Broke out, then fell back to the stop"
-        elif hit_target:
-            reason = reason or "Already reached its target"
-        elif (last["c"] - entry if long else entry - last["c"]) > 0.5 * risk:
-            reason = reason or "Price has moved on from the entry"
-    if when > flat or now.time() > c["no_entries_after"]:
-        reason = reason or "Too late in the day for a new trade"
+    if reason is None and when.time() > c["strong_only_after"] and score < 8:
+        reason = "Afternoon: only strong signals (8+) count; this one scored %d" % score
     if reason is None and score < 6:
         weakest = min((p / mx, k) for k, _, p, mx in factors)[1]
         reason = "Score %d: %s" % (score, (WEAK_REASON if long else WEAK_REASON_SHORT)[weakest])
+    signal_reason = reason            # how it looked AT the breakout (None = it was a valid signal then)
+
+    # what happened after the breakout: whichever of stop or target came FIRST
+    after = bars[i + 1:]
+    outcome, now_reason = "running", None
+    k_stop = next((k for k, x in enumerate(after) if ((x["l"] <= stop) if long else (x["h"] >= stop))), None)
+    k_tgt = next((k for k, x in enumerate(after) if ((x["h"] >= target) if long else (x["l"] <= target))), None)
+    if k_stop is not None and (k_tgt is None or k_stop <= k_tgt):
+        outcome, now_reason = "stop", "Broke out, then fell back to the stop"
+    elif k_tgt is not None:
+        outcome, now_reason = "target", "Already reached its target"
+    elif after and (last["c"] - entry if long else entry - last["c"]) > 0.5 * risk:
+        now_reason = "Price has moved on from the entry"
+    if now_reason is None and (when > flat or now.time() > c["no_entries_after"]):
+        now_reason = "Broke out at %s, still running. Too late to enter now (after %s)" % (
+            hhmm(when.time()), hhmm(c["no_entries_after"]))
+    reason = signal_reason or now_reason
 
     out = dict(base, kind="skip" if reason else "pick", side=side, reason=reason, score=score,
+               signal_reason=signal_reason, signal_valid=signal_reason is None, outcome=outcome,
+               now_reason=now_reason,
                factors=factors, checks=checks, trigger_index=i, signal_time=when, entry=entry, stop=stop,
                target=target, lock=lock, risk=round(risk, 2), exit_by=exit_by, qty=qty,
                cost=round(qty * entry, 2), loss_at_stop=-net(side, qty, entry, stop) if qty else 0.0,
                gain_at_target=net(side, qty, entry, target) if qty else 0.0,
                break_even=break_even(side, qty, entry) if qty else None,
                volume_ratio=round(vr, 1) if vr else None, vwap=round(vw, 2) if vw else None,
-               strength="Strong" if score >= 8 else "Normal")
+               strength="Strong" if score >= 8 else "Normal", raw_score=raw, rvol=round(rv, 1) if rv else None,
+               range_ratio=round(range_ratio, 2) if range_ratio is not None else None, edge=edge_pct,
+               lab={"before_11": when.time() <= c["early_until"], "in_play": bool(rv and rv >= 2.0),
+                    "trend_rising": sma_rising(daily or []) if long else (
+                        None if sma_rising(daily or []) is None else not sma_rising(daily or [])),
+                    "sector_up": None if not sector or sector[1] is None else (
+                        sector[1] > 0 if long else sector[1] < 0),
+                    "range_ratio": round(range_ratio, 2) if range_ratio is not None else None},
+               sector=sector)
+    out["why"] = why_line(out)
+    return out
+
+
+def why_line(r):
+    """Plain English: what makes this signal strong, and what to watch."""
+    long = r["side"] == "buy"
+    good, watch = [], []
+    pts = {k: p for k, _, p, _ in r["factors"]}
+    if pts["volume"] == 2 and r.get("volume_ratio"):
+        good.append("%s %.1f\u00d7 normal on the breakout" % ("buying" if long else "selling", r["volume_ratio"]))
+    if pts["inplay"] and r.get("rvol"):
+        good.append("in play (%.1f\u00d7 its usual volume today)" % r["rvol"])
+    if pts["relative"] and r.get("edge") is not None:
+        good.append("%.1f%% %s than Nifty" % (abs(r["edge"]), "stronger" if long else "weaker"))
+    if pts["vwap"]:
+        good.append("%s the day's average price" % ("above" if long else "below"))
+    if pts["early"]:
+        good.append("early in the day")
+    sec = r.get("sector")
+    if sec and sec[1] is not None and ((sec[1] > 0) if long else (sec[1] < 0)):
+        good.append("%s sector %+.1f%%" % (sec[0], sec[1]))
+    if not pts["market"]:
+        watch.append("market %s" % ("falling" if long else "rising"))
+    if not pts["room"]:
+        watch.append("yesterday's %s is between entry and target" % ("high" if long else "low"))
+    if not pts["trend"]:
+        watch.append("against its 20-day trend")
+    if not pts["inplay"]:
+        watch.append("normal trading interest only")
+    out = ("Strong because: " + ", ".join(good[:4]) + ".") if good else ""
+    if watch:
+        out += (" " if out else "") + "Watch: " + ", ".join(watch[:2]) + "."
     return out
 
 
@@ -620,6 +758,54 @@ def live_prices(symbols):
         if p:
             out[sym] = float(p)
     return out
+
+
+def fetch_daily_chart(sym):
+    """Three months of daily bars (high, low, close, volume) for the ATR range-size check."""
+    return scan.parse_chart(scan.yahoo_get(scan.chart_path(sym, "3mo", "1d")), sym)
+
+
+def fetch_sectors():
+    """{tile name: % move today} for NSE sector indices on Yahoo (a tile without data is left out)."""
+    data, _ = scan.fetch_spark([y for _, y in SECTORS], "1d", "5m", 0.2)
+    out = {}
+    for name, y in SECTORS:
+        sres = data.get(y) or data.get(y.upper())
+        m = (sres or {}).get("meta") or {}
+        price, prev = m.get("regularMarketPrice"), m.get("chartPreviousClose") or m.get("previousClose")
+        if price and prev:
+            out[name] = round((float(price) / float(prev) - 1) * 100, 2)
+    return out
+
+
+def breadth(daily, spark, day, now):
+    """(up, down) among stocks with a last 5-minute close today and a previous close."""
+    up = down = 0
+    for sym, s5 in spark.items():
+        bars = day_bars(s5, day, now)
+        prev = closes_before(daily.get(sym) or {}, day)
+        if not bars or not prev:
+            continue
+        if bars[-1]["c"] > prev[-1]:
+            up += 1
+        elif bars[-1]["c"] < prev[-1]:
+            down += 1
+    return up, down
+
+
+def next_open(now):
+    d = now.date() + datetime.timedelta(days=1 if now.time() >= datetime.time(9, 15) else 0)
+    for _ in range(15):
+        if scan.trading_day(d)[0]:
+            return d
+        d += datetime.timedelta(days=1)
+    return d
+
+
+def refresh_seconds(now):
+    """Option A: 60 s before the open on a trading day, 30 s in market hours, None (off) otherwise."""
+    phase, _ = market_phase(now)
+    return {"pre": 60, "forming": 30, "open": 30}.get(phase)
 
 
 def closes_before(series, day):

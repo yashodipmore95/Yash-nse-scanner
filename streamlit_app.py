@@ -153,7 +153,8 @@ with st.sidebar:
     if source == "My symbols":
         typed = st.text_area("NSE symbols, comma separated", "RELIANCE, TCS, INFY, ITC, SBIN, TATASTEEL")
     shorts = st.toggle("Show SELL (short) signals", value=False)
-    auto = st.toggle("Auto-refresh every 30 seconds", value=True)
+    auto = st.toggle("Auto-refresh in market hours", value=True,
+                     help="Every 30 s from 9:15 AM to 3:30 PM, once a minute before the open, off otherwise.")
     if st.button("Refresh now"):
         st.session_state["bump"] = st.session_state.get("bump", 0) + 1
     st.caption("Groww intraday charges are included in every rupee figure. Estimates: your contract note is "
@@ -199,6 +200,28 @@ def chart(sym, key):
         return engine.fetch_chart(sym)
     except Exception:
         return None
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def daily_chart(sym, day):
+    try:
+        return engine.fetch_daily_chart(sym)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=240, show_spinner=False)
+def sectors(key):
+    try:
+        return engine.fetch_sectors()
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def industry_map(day):
+    rows, _ = lists.load_preset("ind_nifty500list.csv")
+    return {sym: engine.sector_of(ind) for sym, ind in rows if engine.sector_of(ind)}
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -255,18 +278,18 @@ def took_dialog(pick):
 
 
 @st.dialog("Sold at another price")
-def other_price_dialog(trade, price_now, followed=None):
+def other_price_dialog(trade, price_now, tag=None):
     st.write("**%s**: the price you %s at." % (trade["symbol"], "sold" if trade["side"] == "buy" else "bought back"))
     price = st.number_input("Price (\u20b9)", value=float(price_now), step=0.05, format="%.2f")
     st.caption("Result after charges: %s" % engine.rupees(engine.net(trade["side"], trade["qty"], trade["entry"],
                                                                           price), True))
     if st.button("Save", type="primary", use_container_width=True):
-        close(trade, price, "other", followed)
+        close(trade, price, "other", tag)
 
 
-def close(trade, price, how, followed=None):
+def close(trade, price, how, tag=None):
     try:
-        done = journal.close_trade(trade, price, how, engine.now_ist(), followed)
+        done = journal.close_trade(trade, price, how, engine.now_ist(), tag=tag)
     except journal.JournalError as e:
         st.error(str(e))
         return
@@ -277,10 +300,14 @@ def close(trade, price, how, followed=None):
 # ---------------------------------------------------------------- the page
 
 def scan_market(now, day, key, key30, nifty, data):
-    """Scan the chosen stocks. Returns (picks, watch, skipped, note, scanned, checked)."""
+    """Scan the chosen stocks -> dict(picks, watch, skipped, allpicks, scanned, checked, note, up, down, sectors)."""
+    out = {"picks": [], "watch": [], "skipped": [], "finished": [], "allpicks": [], "scanned": 0, "checked": 0,
+           "note": "",
+           "up": 0, "down": 0, "sectors": sectors(key)}
     syms, note = symbols_for(source, typed, day.isoformat())
     if not syms:
-        return [], [], [], note or "empty", 0, 0   # 4th item is the note when there is no list
+        out["note"] = note or "empty"
+        return out
     daily, _ = daily_data(tuple(syms), day.isoformat())
     inrange = []
     for s_ in syms:
@@ -290,25 +317,35 @@ def scan_market(now, day, key, key30, nifty, data):
             inrange.append((-(p * (m.get("regularMarketVolume") or 0)), s_))
     inrange = [s_ for _, s_ in sorted(inrange)][:250]
     spark, _ = spark_5m(tuple(inrange), key) if inrange else ({}, {})
+    out["up"], out["down"] = engine.breadth(daily, spark, day, now)
     cands = set(engine.stage_one(spark, now, CFG))
     cands = [s_ for s_ in inrange if s_ in cands][:25]
+    industries = industry_map(day.isoformat())
     results = []
     for s_ in cands:
         series = chart(s_, key)
         if not series:
             continue
         closes = engine.closes_before(daily.get(s_) or {}, day)
-        r = engine.analyse(s_, series, closes, nifty, now, CFG)
+        sec_name = industries.get(s_)
+        sec = (sec_name, out["sectors"].get(sec_name)) if sec_name else None
+        dchart = daily_chart(s_, day.isoformat())
+        r = engine.analyse(s_, series, closes, nifty, now, CFG, daily_chart=dchart, sector=sec)
         if r and r["kind"] == "pick":
-            r = engine.analyse(s_, series, closes, nifty, now, CFG, news_flag=news(s_, now.hour))
+            r = engine.analyse(s_, series, closes, nifty, now, CFG, news_flag=news(s_, now.hour),
+                               daily_chart=dchart, sector=sec)
         results.append(r)
     traded = {t["symbol"] for t in journal.today(data, mode, day)}
     for r in results:
         if r and r["kind"] == "pick" and r["symbol"] in traded:
             r.update(kind="skip", reason="You already traded it today")
-    picks, watch, skipped = engine.rank(results)
-    allpicks = [r for r in results if r and (r["kind"] == "pick" or r.get("reason") == "You already traded it today")]
-    return picks, watch, skipped, allpicks, len(inrange), len(cands)
+    out["picks"], out["watch"], skipped = engine.rank(results)
+    out["finished"] = [r for r in skipped if r.get("outcome") in ("target", "stop")]
+    out["skipped"] = [r for r in skipped if r.get("outcome") not in ("target", "stop")]
+    # every breakout that was a valid signal AT ITS TIME is tracked, even if the page opened later
+    out["allpicks"] = [r for r in results if r and r.get("signal_valid")]
+    out["scanned"], out["checked"] = len(inrange), len(cands)
+    return out
 
 
 def track_signals(data, allpicks, now, key):
@@ -343,7 +380,8 @@ def focus(t, now, key, key30, nifty, phase):
             except TypeError:  # older Streamlit
                 st.rerun()
     st.caption("How did it end?" if stt["alert"] in ("stop", "target", "exit") else "Closed it already?")
-    followed = st.toggle("I followed my rules on this trade", value=True, key="f" + t["id"])
+    tag = st.radio("How did this trade go, honestly?", journal.TAGS, index=0, horizontal=True, key="tag" + t["id"])
+    followed = tag
     b1, b2, b3 = st.columns(3)
     if b1.button("Hit target %s" % ui.p2(t["target"]), key="t" + t["id"], use_container_width=True,
                  type="primary" if stt["alert"] == "target" else "secondary"):
@@ -364,8 +402,9 @@ def keys(now):
 
 
 def header(now, clock=True):
-    html('<div class="v1row"><b style="font-size:20px">&#128200; NSE scanner</b><span class="v1mut">%s</span>'
-         '</div>' % ("&#8635; " + now.strftime("%I:%M:%S %p").lstrip("0") if clock else ""))
+    html('<div class="v1row"><b style="font-size:20px">&#128200; NSE scanner</b><span>%s <span class="v1mut">%s'
+         '</span></span></div>' % (ui.refresh_badge(RUN_EVERY, focus=not clock),
+                                   now.strftime("%I:%M:%S %p").lstrip("0") if clock else ""))
     html('<span class="v1pill" style="background:var(--bg-b);color:var(--b)">%s</span>'
          '<span class="v1pill" style="border:1px solid var(--line)">%s capital</span>'
          '<span class="v1pill" style="border:1px solid var(--line)">Max loss %s</span>'
@@ -379,12 +418,27 @@ def header(now, clock=True):
                    "Use the download button at the bottom to keep them.")
 
 
+def schedule_message(now, phase, msg):
+    nxt = engine.next_open(now)
+    when = "today" if nxt == now.date() else nxt.strftime("%a %d %b")
+    if phase == "after":
+        return "Market closed at 3:30 PM. Auto-refresh is off. Next open: %s, 9:15 AM. " \
+               "Today's signals stay below for review." % when
+    if phase == "closed":
+        return "%s. Auto-refresh is off. Next open: %s, 9:15 AM." % (msg, when)
+    if phase == "pre":
+        return "NSE opens at 9:15 AM. This page checks once a minute and starts by itself at the open."
+    return msg
+
+
 def focus_panel():
     """Focus mode: only this panel refreshes. No market scan runs while a trade is open."""
     renew_login()
     now = engine.now_ist()
     key, key30 = keys(now)
     phase, _ = engine.market_phase(now)
+    if phase != st.session_state.get("phase_at_start"):
+        st.rerun()
     opens = journal.open_trades(load_journal(), mode)
     if not opens:                                   # closed in another tab: back to the full page
         st.rerun()
@@ -401,6 +455,9 @@ def page():
     key, key30 = keys(now)
     data = load_journal()
     phase, phase_msg = engine.market_phase(now)
+    if phase != st.session_state.get("phase_at_start"):      # e.g. 9:15 or 3:30 passed: reset the schedule
+        st.rerun()
+    phase_msg = schedule_message(now, phase, phase_msg)
     header(now)
     html('<span class="v1pill" style="background:var(--bg-b);color:var(--b)">%s</span>'
          '<span class="v1pill" style="border:1px solid var(--line)">%s capital</span>'
@@ -415,15 +472,16 @@ def page():
     if phase_msg:
         st.info(phase_msg)
 
-    picks = watch = skipped = []
-    scanned = checked = 0
-    note = ""
+    res = {"picks": [], "watch": [], "skipped": [], "finished": [], "scanned": 0, "checked": 0, "note": "",
+           "up": 0, "down": 0, "sectors": {}}
     if phase in ("open", "after"):
         with st.spinner("Updating..."):
-            picks, watch, skipped, allpicks, scanned, checked = scan_market(now, day, key, key30, nifty, data)
-            if isinstance(allpicks, str):
-                note, allpicks = allpicks, []
-            data = track_signals(load_journal(), allpicks, now, key)
+            res = scan_market(now, day, key, key30, nifty, data)
+            data = track_signals(load_journal(), res["allpicks"], now, key)
+        html(ui.sector_tiles(res["sectors"]))
+        html(ui.breadth_bar(res["up"], res["down"]))
+    picks, watch, skipped = res["picks"], res["watch"], res["skipped"]
+    scanned, checked, note = res["scanned"], res["checked"], res["note"]
 
     if journal.open_trades(data, mode):            # a trade was just opened: switch to focus mode
         st.rerun()
@@ -461,7 +519,10 @@ def page():
         if watch:
             html('<div class="v1sec">Getting close</div>')
             html(ui.watch_rows(watch))
-        with st.expander("Skipped today: %d stocks" % len(skipped)):
+        if res["finished"]:
+            with st.expander("Already finished today: %d breakouts" % len(res["finished"])):
+                html(ui.finished_rows(res["finished"]))
+        with st.expander("Skipped right now: %d stocks" % len(skipped)):
             html(ui.skipped_rows(skipped) or '<span class="v1mut">None yet.</span>')
         st.caption("Scanned %d stocks priced \u20b9%g\u2013%g from %s; %d had a full check."
                    % (scanned, min_price, max_price, source, checked))
@@ -473,13 +534,19 @@ def page():
 
 def results_section(data):
     html('<div class="v1sec">My results (%s)</div>' % ("practice" if mode == "paper" else "real money"))
-    html(ui.results_card(journal.results(data, mode), mode))
+    res = journal.results(data, mode)
+    if mode == "paper":
+        html(ui.readiness_card(res["ready"]))
+    html(ui.results_card(res, mode))
     html(ui.signals_card(journal.signal_stats(data)))
+    html(ui.lab_card(journal.lab_stats(data)))
 
 
-run_every = 30 if auto else None
-fragment = (lambda f: st.fragment(run_every=run_every)(f)) if (hasattr(st, "fragment") and run_every) else (lambda f: f)
 _now = engine.now_ist()
+st.session_state["phase_at_start"] = engine.market_phase(_now)[0]
+RUN_EVERY = engine.refresh_seconds(_now) if auto else None     # Option A: 60 s before 9:15, 30 s open, else off
+run_every = RUN_EVERY
+fragment = (lambda f: st.fragment(run_every=run_every)(f)) if (hasattr(st, "fragment") and run_every) else (lambda f: f)
 _data = load_journal()
 if journal.open_trades(_data, mode):
     # Focus mode: the header, day bar and results stay still; only the trade panel refreshes.

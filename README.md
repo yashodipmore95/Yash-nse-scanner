@@ -25,9 +25,13 @@ requirements.txt          streamlit>=1.37
 - Stocks: your chosen list (F&O stocks by default), priced between your min and max (₹100–500).
 - Signal: a 5-minute candle closes above the 9:15–9:30 high (BUY), or below the low (SELL, only
   with the short switch on).
-- Score out of 10: breakout candle (2), buying power / volume (2), above the day's average price
-  VWAP (1), stronger than Nifty (2), above its 20-day average (1), room to the target (1), market
-  not falling (1). Strong buy 8–10, buy 6–7, skip under 6.
+- Score out of 10 (13 points scaled to 10): breakout candle (2), buying power on the breakout (2),
+  in play: today's volume at least 1.3× / 2× its usual by this time (1 / 2), above the day's
+  average price VWAP (1), stronger than Nifty (2), above its 20-day average (1), room to the target
+  (1), market not falling (1), breakout before 11 AM (1). Strong buy 8–10, buy 6–7, skip under 6.
+  After 1 PM only 8+ counts.
+- Range size: the 9:15–9:30 range must be 0.25× to 1.2× the stock's normal daily move (14-day
+  ATR); a range outside that is skipped.
 - Always skipped: results or big news in the headlines, a big opening gap, already up more than
   3%, a signal outside 9:30 AM–2:30 PM, too risky for your capital, outside your price range,
   price already moved on, hit its stop or target, or a stock you already traded today.
@@ -51,7 +55,34 @@ requirements.txt          streamlit>=1.37
 - When it ends, tap Hit target, Hit stop-loss or Sold at another price. The "I followed my rules"
   switch (on by default) feeds your discipline score.
 
+## Opening the page late
+
+Breakouts that already finished today appear under **Already finished today**: each with its
+breakout time, its score at that moment, whether the scanner would have taken it, and whether it
+hit the target or the stop (whichever came first). Every breakout that was a valid signal at its
+own time is recorded in the signal tracker and the filter lab, even if the page was opened later.
+**Skipped right now** lists only stocks that fail a rule at the moment.
+
+## Market view
+
+- Sector tiles: Bank, IT, Auto, Pharma, Metal, FMCG, Energy and Realty indices, green or red by
+  today's move (a tile Yahoo has no data for is hidden). A pick card shows "Sector strong" when the
+  stock's sector (from the Nifty 500 list's industry; financial services use the Bank index) is
+  moving its way.
+- Market breadth: how many of the scanned stocks are up versus down today.
+- Refresh: once a minute before 9:15 AM on a trading day (so it starts by itself), every 30
+  seconds from 9:15 AM to 3:30 PM, off after the close and on weekends and NSE holidays. The badge
+  at the top shows which.
+
 ## What your results show
+
+- Ready for real money? (practice mode): 50 practice trades, a positive total after charges, a win
+  rate of 50% or more, and your rules followed 90%+ of the time.
+- When you close a trade, one tap says how it went: Followed plan, Entered late, Moved stop-loss,
+  Exited early, Skipped stop-loss or Other mistake. Your results show your most common mistake.
+- Filter lab: every signal also records whether it came before 11 AM, was in play, had a rising
+  20-day average and had its sector moving the same way. Its win rate with and without each
+  appears here, so you can see which extra rule is worth turning on.
 
 - Running total after charges, win rate, average win and loss.
 - Discipline: how often you followed your rules. Slippage: your real entry versus the signal
