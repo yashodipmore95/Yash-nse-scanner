@@ -18,6 +18,8 @@ import streamlit as st
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCAN = os.path.join(HERE, "trader-scanner", "scan.py")
 UNIVERSE = os.path.join(HERE, "trader", "universe.txt")
+EQUITY_L = os.path.join(HERE, "trader", "EQUITY_L.csv")
+BUILT = os.path.join(HERE, "trader", ".universe-built.txt")
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 SETUP_WORDS = {
@@ -80,10 +82,34 @@ def cached_scan(args_tuple, minute_key):
     return run_scan(list(args_tuple))
 
 
-def universe_count():
-    if not os.path.exists(UNIVERSE):
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def build_universe(source_mtime):
+    """Turn NSE's EQUITY_L.csv into the scanner's stock list: the file in the repository if it is
+    there, else a download from NSE (which often refuses cloud servers). Returns (path or None, note)."""
+    args = [sys.executable, SCAN, "universe", "--out", BUILT]
+    if os.path.exists(EQUITY_L):
+        args += ["--offline", EQUITY_L]
+    try:
+        p = subprocess.run(args, cwd=HERE, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return None, "NSE took too long to answer."
+    if p.returncode == 0 and os.path.exists(BUILT):
+        return BUILT, (p.stdout or "").strip().splitlines()[0] if p.stdout else ""
+    return None, (p.stderr or p.stdout or "").strip()
+
+
+def universe_path():
+    """trader/universe.txt if you uploaded it, else one built from EQUITY_L.csv or from NSE."""
+    if os.path.exists(UNIVERSE):
+        return UNIVERSE, ""
+    mtime = os.path.getmtime(EQUITY_L) if os.path.exists(EQUITY_L) else datetime.date.today().isoformat()
+    return build_universe(mtime)
+
+
+def universe_count(path):
+    if not path or not os.path.exists(path):
         return 0
-    with open(UNIVERSE, encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         return sum(1 for ln in fh if ln.strip())
 
 
@@ -126,7 +152,8 @@ with st.sidebar:
     mode = st.radio("What to scan", ["Opening-range breakouts (after 9:35 AM)", "Daily setups (before 9:15 AM or after 3:30 PM)"])
     is_orb = mode.startswith("Opening")
 
-    n_uni = universe_count()
+    uni_path, uni_note = universe_path()
+    n_uni = universe_count(uni_path)
     source_opts = ["My symbols (type them)"]
     if n_uni:
         source_opts.insert(0, "Whole stock list (%d NSE stocks)" % n_uni)
@@ -134,7 +161,8 @@ with st.sidebar:
     symbols = ""
     limit = 0
     if source.startswith("My symbols"):
-        symbols = st.text_area("NSE symbols, comma separated", "RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK, SBIN, "
+        symbols = st.text_area("Type any NSE symbols, comma separated (the ones shown are only an example)",
+                               "RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK, SBIN, "
                                "ITC, LT, AXISBANK, BHARTIARTL, M&M, TATASTEEL")
     else:
         limit = st.number_input("Scan only the first N (0 = all; the whole list takes a few minutes)",
@@ -149,9 +177,12 @@ with st.sidebar:
     go = st.button("Run scan", type="primary", use_container_width=True)
 
 if not n_uni:
-    st.info("No stock list yet, so you can scan symbols you type. To scan all of NSE, build the list on your "
-            "computer or phone with `python3 trader-scanner/scan.py universe` and add the file "
-            "`trader/universe.txt` to this app's GitHub repository (see README.md).")
+    st.info("No NSE stock list yet (NSE refused this server), so you can scan symbols you type. To scan all of "
+            "NSE: download EQUITY_L.csv from nsearchives.nseindia.com/content/equities/EQUITY_L.csv in your "
+            "browser and upload it into a `trader` folder in this app's GitHub repository. No Python needed.")
+    if uni_note:
+        with st.expander("Why"):
+            st.code(uni_note)
 
 if go:
     args = ["orb" if is_orb else "daily", "--min-price", str(min_price)]
@@ -162,7 +193,7 @@ if go:
             st.stop()
         args += ["--symbols", syms]
     else:
-        args += ["--universe", UNIVERSE]
+        args += ["--universe", uni_path]
         if limit:
             args += ["--limit", str(int(limit))]
     if is_orb:
