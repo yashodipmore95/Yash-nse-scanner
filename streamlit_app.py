@@ -1,76 +1,45 @@
-"""NSE Chart Scanner, online. A small Streamlit page around trader-scanner/scan.py.
+"""NSE intraday scanner, version 1. A Streamlit page around engine.py, journal.py and ui.py.
 
 Run on your computer:   pip install streamlit  &&  streamlit run streamlit_app.py
 Host it for free:       Streamlit Community Cloud (see README.md)
 
-It only scans charts. It never places, sizes or checks an order, and a hit is a
-chart that matched a rule, not a stock to buy. Not financial advice.
+It scans, scores and sizes trades and tracks the ones you tell it you took. It never places
+orders and never asks for a broker login. A pick is a chart that matched rules, not a promise.
+Not financial advice.
 """
 
-import csv
 import datetime
-import io
 import json
-import os
-import subprocess
-import sys
-import urllib.request
 
 import streamlit as st
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SCAN = os.path.join(HERE, "trader-scanner", "scan.py")
-UNIVERSE = os.path.join(HERE, "trader", "universe.txt")
-EQUITY_L = os.path.join(HERE, "trader", "EQUITY_L.csv")
-BUILT = os.path.join(HERE, "trader", ".universe-built.txt")
-LISTS = os.path.join(HERE, "trader", "lists")
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/124.0 Safari/537.36")
+import engine
+import journal
+import lists
+import ui
 
-# Ready-made lists: NSE Indices' constituent files, and NSE's F&O list. The app downloads them (once a day);
-# if a server refuses, upload the same file into trader/lists/ in the repository.
-PRESETS = {
-    "Nifty 50": "ind_nifty50list.csv",
-    "Nifty 100": "ind_nifty100list.csv",
-    "Nifty 200": "ind_nifty200list.csv",
-    "Nifty 500": "ind_nifty500list.csv",
-    "Nifty Midcap 100": "ind_niftymidcap100list.csv",
-    "Nifty Bank": "ind_niftybanklist.csv",
-    "F&O stocks (most liquid for intraday)": "fo_mktlots.csv",
-}
-INDEX_URLS = ("https://www.niftyindices.com/IndexConstituent/%s",
-              "https://nsearchives.nseindia.com/content/indices/%s")
-FNO_URL = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
-INDEX_NAMES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "SENSEX", "BANKEX"}
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-
-SETUP_WORDS = {
-    "orb": "Opening-range breakout",
-    "breakout_20d": "20-day closing high",
-    "bull_flag": "Bull flag",
-    "reclaim_ma20": "Reclaimed 20-day average",
-    "oversold": "Oversold (RSI under 30)",
-    "oversold_bounce": "Oversold bounce",
-}
-
-st.set_page_config(page_title="NSE Chart Scanner", page_icon="\U0001F4C8", layout="wide")
+st.set_page_config(page_title="NSE scanner", page_icon="\U0001F4C8", layout="centered")
+st.markdown(ui.CSS, unsafe_allow_html=True)
 
 
-# ---------------------------------------------------------------- optional password
+def html(s):
+    st.markdown(s, unsafe_allow_html=True)
+
 
 def secret(name):
     try:
         return st.secrets.get(name)
-    except Exception:  # no secrets file: no password
+    except Exception:  # no secrets file
         return None
 
 
+# ---------------------------------------------------------------- password
+
 def password_ok():
     pw = secret("APP_PASSWORD")
-    if not pw:
+    if not pw or st.session_state.get("pw_ok"):
         return True
-    if st.session_state.get("pw_ok"):
-        return True
+    st.title("\U0001F4C8 NSE scanner")
     typed = st.text_input("Password", type="password")
     if typed and typed == pw:
         st.session_state["pw_ok"] = True
@@ -80,248 +49,316 @@ def password_ok():
     return False
 
 
-# ---------------------------------------------------------------- running the scanner
+if not password_ok():
+    st.stop()
 
-def run_scan(args):
-    """Run scan.py with --json and return (doc or None, error text)."""
-    cmd = [sys.executable, SCAN] + args + ["--json", "--no-write"]
-    try:
-        p = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True, timeout=600)
-    except subprocess.TimeoutExpired:
-        return None, "The scan took longer than 10 minutes and was stopped. Try a smaller list."
-    out = (p.stdout or "").strip()
-    if out.startswith("{"):
+
+# ---------------------------------------------------------------- journal storage
+
+def store():
+    token, repo = secret("GITHUB_TOKEN"), secret("JOURNAL_REPO")
+    if token and repo:
+        if "store" not in st.session_state:
+            st.session_state["store"] = journal.GitHubStore(token, repo, secret("JOURNAL_PATH") or "journal.json")
+        return st.session_state["store"]
+    return None
+
+
+def load_journal():
+    if "journal" not in st.session_state:
+        s = store()
+        data = journal.empty()
+        if s:
+            try:
+                data = s.load()
+            except journal.JournalError as e:
+                st.session_state["journal_error"] = str(e)
+        st.session_state["journal"] = data
+    return st.session_state["journal"]
+
+
+def save_journal(data, message):
+    st.session_state["journal"] = data
+    s = store()
+    if s:
         try:
-            return json.loads(out), (p.stderr or "").strip()
-        except ValueError:
-            pass
-    return None, (p.stderr or out or "The scanner stopped without saying why.").strip()
+            s.save(data, message)
+            st.session_state.pop("journal_error", None)
+        except journal.JournalError as e:
+            st.session_state["journal_error"] = str(e)
+
+
+# ---------------------------------------------------------------- settings (side panel)
+
+with st.sidebar:
+    st.header("Settings")
+    mode_label = st.radio("Mode", ["Practice (paper)", "Real money"], index=0)
+    mode = "paper" if mode_label.startswith("Practice") else "real"
+    capital = st.number_input("Capital (\u20b9)", min_value=500.0, value=5000.0, step=500.0)
+    max_loss = st.number_input("Max loss per trade (\u20b9)", min_value=10.0, value=75.0, step=5.0)
+    max_trades = st.number_input("Max trades per day", min_value=1, max_value=5, value=2, step=1)
+    daily_loss = st.number_input("Stop for the day after losing (\u20b9)", min_value=10.0, value=150.0, step=10.0)
+    c1, c2 = st.columns(2)
+    min_price = c1.number_input("Min price \u20b9", min_value=1.0, value=100.0, step=10.0)
+    max_price = c2.number_input("Max price \u20b9", min_value=10.0, value=500.0, step=10.0)
+    source = st.selectbox("Stocks to scan", list(lists.PRESETS) + ["Whole NSE list", "My symbols"])
+    typed = ""
+    if source == "My symbols":
+        typed = st.text_area("NSE symbols, comma separated", "RELIANCE, TCS, INFY, ITC, SBIN, TATASTEEL")
+    shorts = st.toggle("Show SELL (short) signals", value=False)
+    auto = st.toggle("Auto-refresh every 5 minutes", value=True)
+    if st.button("Refresh now"):
+        st.session_state["bump"] = st.session_state.get("bump", 0) + 1
+    st.caption("Groww intraday charges are included in every rupee figure. Estimates: your contract note is "
+               "the real number.")
+
+CFG = {"capital": capital, "max_loss": max_loss, "max_trades": int(max_trades), "daily_loss": daily_loss,
+       "min_price": min_price, "max_price": max_price, "shorts": shorts}
+
+
+# ---------------------------------------------------------------- cached data
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def symbols_for(source, typed, day):
+    if source == "My symbols":
+        return [s.strip().upper() for s in typed.replace("\n", ",").split(",") if s.strip()], ""
+    if source == "Whole NSE list":
+        return lists.universe()
+    rows, note = lists.load_preset(lists.PRESETS[source])
+    return [s for s, _ in rows], note
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def daily_data(symbols, day):
+    return engine.fetch_daily(symbols)
 
 
 @st.cache_data(ttl=240, show_spinner=False)
-def cached_scan(args_tuple, minute_key):
-    """Same request in the same few minutes: reuse the answer instead of asking Yahoo again."""
-    return run_scan(list(args_tuple))
+def spark_5m(symbols, key):
+    return engine.fetch_intraday_closes(symbols)
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def build_universe(source_mtime):
-    """Turn NSE's EQUITY_L.csv into the scanner's stock list: the file in the repository if it is
-    there, else a download from NSE (which often refuses cloud servers). Returns (path or None, note)."""
-    args = [sys.executable, SCAN, "universe", "--out", BUILT]
-    if os.path.exists(EQUITY_L):
-        args += ["--offline", EQUITY_L]
+@st.cache_data(ttl=240, show_spinner=False)
+def chart(sym, key):
     try:
-        p = subprocess.run(args, cwd=HERE, capture_output=True, text=True, timeout=120)
-    except subprocess.TimeoutExpired:
-        return None, "NSE took too long to answer."
-    if p.returncode == 0 and os.path.exists(BUILT):
-        return BUILT, (p.stdout or "").strip().splitlines()[0] if p.stdout else ""
-    return None, (p.stderr or p.stdout or "").strip()
+        return engine.fetch_chart(sym)
+    except Exception:
+        return None
 
 
-def universe_path():
-    """trader/universe.txt if you uploaded it, else one built from EQUITY_L.csv or from NSE."""
-    if os.path.exists(UNIVERSE):
-        return UNIVERSE, ""
-    mtime = os.path.getmtime(EQUITY_L) if os.path.exists(EQUITY_L) else datetime.date.today().isoformat()
-    return build_universe(mtime)
+@st.cache_data(ttl=1800, show_spinner=False)
+def news(sym, hour):
+    try:
+        return engine.news_flag(engine.fetch_news(sym), engine.now_ist())
+    except Exception:
+        return None
 
 
-def parse_list(text):
-    """A constituents CSV (Symbol, Industry columns) or NSE's fo_mktlots.csv -> [(symbol, industry)]."""
-    text = (text or "").lstrip("\ufeff")
-    if not text.strip() or text.lstrip().startswith("<"):
-        return []
-    rows = list(csv.reader(io.StringIO(text)))
-    head_i, sym_i, ind_i = None, None, None
-    for i, r in enumerate(rows[:5]):
-        cells = [c.strip().upper() for c in r]
-        if "SYMBOL" in cells:
-            head_i, sym_i = i, cells.index("SYMBOL")
-            ind_i = cells.index("INDUSTRY") if "INDUSTRY" in cells else None
-            break
-    if head_i is None:
-        return []
-    out, seen = [], set()
-    for r in rows[head_i + 1:]:
-        if len(r) <= sym_i:
-            continue
-        sym = r[sym_i].strip().upper()
-        if not sym or sym == "SYMBOL" or sym in INDEX_NAMES or sym in seen:
-            continue
-        seen.add(sym)
-        out.append((sym, r[ind_i].strip() if ind_i is not None and len(r) > ind_i else ""))
-    return out
+# ---------------------------------------------------------------- dialogs
 
-
-def fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*",
-                                               "Referer": "https://www.nseindia.com/"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode("utf-8-sig", "replace")
-
-
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def load_preset(fname, day_key):
-    """(rows, note): trader/lists/<fname> if uploaded, else a download (once a day)."""
-    local = os.path.join(LISTS, fname)
-    if os.path.exists(local):
-        with open(local, encoding="utf-8-sig", errors="replace") as fh:
-            rows = parse_list(fh.read())
-        return rows, "" if rows else "%s in the repository has no Symbol column." % fname
-    urls = [FNO_URL] if fname == "fo_mktlots.csv" else [u % fname for u in INDEX_URLS]
-    last = ""
-    for url in urls:
+@st.dialog("I took this trade")
+def took_dialog(pick):
+    long = pick["side"] == "buy"
+    st.write("**%s** %s. Enter what actually happened in Groww." % (pick["symbol"], "buy" if long else "short sell"))
+    c1, c2 = st.columns(2)
+    entry = c1.number_input("My %s price (\u20b9)" % ("buy" if long else "sell"), value=float(pick["entry"]),
+                            step=0.05, format="%.2f")
+    qty = c2.number_input("Quantity (shares)", value=int(max(pick["qty"], 1)), min_value=1, step=1)
+    stop = st.number_input("My stop-loss (\u20b9)", value=float(pick["stop"]), step=0.05, format="%.2f")
+    bad = None
+    if entry <= 0:
+        bad = "Enter your price."
+    elif long and stop >= entry:
+        bad = "Stop-loss must be below your buy price."
+    elif not long and stop <= entry:
+        bad = "Stop-loss must be above your sell price."
+    if bad:
+        st.error(bad)
+        return
+    mp = journal.money_plan(pick["side"], entry, stop, int(qty), CFG)
+    html('<div class="v1grid" style="margin:6px 0"><div>&#127919; Target <b style="color:var(--g)">&#8377;%s</b></div>'
+         '<div>&#128274; Safety lock <b style="color:var(--a)">&#8377;%s</b></div>'
+         '<div>If stop hits <b style="color:var(--r)">%s</b></div><div>If target hits <b style="color:var(--g)">%s</b>'
+         '</div></div>' % (ui.p2(mp["target"]), ui.p2(mp["lock"]), engine.rupees(-mp["loss"], True),
+                           engine.rupees(mp["gain"], True)))
+    html(ui.rr_bar(mp["loss"], mp["gain"]))
+    st.caption("Break-even \u20b9%s \u00b7 Cost %s \u00b7 Exit by 2:55 PM at the latest"
+               % (ui.p2(mp["break_even"]), engine.rupees(mp["cost"])))
+    fit = engine.size(pick["side"], entry, stop, capital, max_loss)
+    if mp["loss"] > max_loss + 0.005 or mp["cost"] > capital + 0.005:
+        st.warning("This is over your limits (max loss %s, capital %s). Reduce to %d shares."
+                   % (engine.rupees(max_loss), engine.rupees(capital), fit))
+    if st.button("Start tracking", type="primary", use_container_width=True):
         try:
-            rows = parse_list(fetch(url))
-            if rows:
-                return rows, ""
-            last = "%s did not send a stock list" % url.split("/")[2]
-        except Exception as e:  # blocked, offline, changed
-            last = "%s: %s" % (url.split("/")[2], e)
-    return [], last
+            t = journal.new_trade(pick, pick["side"], entry, stop, int(qty), mode, engine.now_ist(), CFG)
+        except journal.JournalError as e:
+            st.error(str(e))
+            return
+        save_journal(journal.replace(load_journal(), t), "Open %s" % t["symbol"])
+        st.rerun()
 
 
-def universe_count(path):
-    if not path or not os.path.exists(path):
-        return 0
-    with open(path, encoding="utf-8") as fh:
-        return sum(1 for ln in fh if ln.strip())
+@st.dialog("Sold at another price")
+def other_price_dialog(trade, price_now):
+    st.write("**%s**: the price you %s at." % (trade["symbol"], "sold" if trade["side"] == "buy" else "bought back"))
+    price = st.number_input("Price (\u20b9)", value=float(price_now), step=0.05, format="%.2f")
+    st.caption("Result after charges: %s" % engine.rupees(engine.net(trade["side"], trade["qty"], trade["entry"],
+                                                                          price), True))
+    if st.button("Save", type="primary", use_container_width=True):
+        close(trade, price, "other")
 
 
-def rupees(x):
+def close(trade, price, how):
     try:
-        return "\u20b9{:,.2f}".format(float(x))
-    except (TypeError, ValueError):
-        return ""
-
-
-def hits_table(doc):
-    rows = []
-    for h in doc.get("hits", []):
-        row = {"Symbol": h.get("symbol"),
-               "Setup": ", ".join(SETUP_WORDS.get(s, s) for s in h.get("setups", [])),
-               "Price": rupees(h.get("price"))}
-        if doc.get("mode") == "orb":
-            row.update({"Time (IST)": h.get("at"), "Range high": rupees(h.get("or_high")),
-                        "Range low": rupees(h.get("or_low")), "% over high": h.get("pct_over")})
-        else:
-            row.update({"RSI 14": h.get("rsi"), "Volume": h.get("volume"), "Close date": h.get("close_date")})
-        rows.append(row)
-    return rows
+        done = journal.close_trade(trade, price, how, engine.now_ist())
+    except journal.JournalError as e:
+        st.error(str(e))
+        return
+    save_journal(journal.replace(load_journal(), done), "Close %s" % trade["symbol"])
+    st.rerun()
 
 
 # ---------------------------------------------------------------- the page
 
-st.title("\U0001F4C8 NSE Chart Scanner")
-st.caption("Free Yahoo Finance data (unofficial, can lag), 5-minute and daily bars, times in IST. "
-           "A scan is a list of charts that match a rule, not a list of stocks to buy. Not financial advice.")
+def page():
+    now = engine.now_ist()
+    day = now.date()
+    key = "%s-%d-%d" % (now.strftime("%Y%m%d%H"), now.minute // 4, st.session_state.get("bump", 0))
+    data = load_journal()
+    phase, phase_msg = engine.market_phase(now)
 
-if not password_ok():
-    st.stop()
+    html('<div class="v1row"><b style="font-size:20px">&#128200; NSE scanner</b><span class="v1mut">&#8635; %s</span>'
+         '</div>' % engine.hhmm(now.time()))
+    html('<span class="v1pill" style="background:var(--bg-b);color:var(--b)">%s</span>'
+         '<span class="v1pill" style="border:1px solid var(--line)">%s capital</span>'
+         '<span class="v1pill" style="border:1px solid var(--line)">Max loss %s</span>'
+         '<span class="v1pill" style="border:1px solid var(--line)">&#8377;%g&ndash;%g</span>'
+         % ("Practice mode" if mode == "paper" else "Real money", engine.rupees(capital),
+            engine.rupees(max_loss), min_price, max_price))
+    if st.session_state.get("journal_error"):
+        st.warning("Journal not saved to GitHub: %s" % st.session_state["journal_error"])
+    elif not store():
+        st.caption("Trades are kept only while this page is open (no GITHUB_TOKEN / JOURNAL_REPO in Secrets). "
+                   "Use the download button at the bottom to keep them.")
 
-now_ist = datetime.datetime.now(IST)
-st.write("It is **%s IST**." % now_ist.strftime("%a %d %b %Y, %I:%M %p"))
+    nifty = chart(engine.NIFTY, key) if phase in ("open", "forming", "after") else None
+    n_today = [b["c"] for b in engine.day_bars(nifty or {}, day, now)]
+    done, why, counts = journal.guard(data, mode, day, CFG)
+    html(ui.day_strip(counts, int(max_trades), n_today))
+    if phase_msg:
+        st.info(phase_msg)
 
-with st.sidebar:
-    st.header("Scan")
-    mode = st.radio("What to scan", ["Opening-range breakouts (after 9:35 AM)", "Daily setups (before 9:15 AM or after 3:30 PM)"])
-    is_orb = mode.startswith("Opening")
+    # open trades first
+    opens = journal.open_trades(data, mode)
+    if opens:
+        html('<div class="v1sec">Your open trade%s</div>' % ("s" if len(opens) > 1 else ""))
+    for t in opens:
+        s = chart(t["symbol"], key)
+        stt = engine.trade_status(t, s, nifty, now, CFG)
+        html(ui.open_trade(t, stt))
+        if stt["alert"]:
+            html(ui.alert(stt["alert"], stt["message"]))
+        if stt["alert"] == "lock":
+            if st.button("Done: I moved my stop-loss to %s" % ui.p2(t["entry"]), key="lock" + t["id"]):
+                save_journal(journal.replace(data, dict(t, stop=t["entry"], stop_moved_at=now.replace(
+                    microsecond=0).isoformat())), "Move stop %s" % t["symbol"])
+                st.rerun()
+        st.caption("How did it end?" if stt["alert"] in ("stop", "target", "exit") else "Closed it already?")
+        b1, b2, b3 = st.columns(3)
+        if b1.button("Hit target %s" % ui.p2(t["target"]), key="t" + t["id"], use_container_width=True,
+                     type="primary" if stt["alert"] == "target" else "secondary"):
+            close(t, t["target"], "target")
+        if b2.button("Hit stop-loss %s" % ui.p2(t["stop"]), key="s" + t["id"], use_container_width=True,
+                     type="primary" if stt["alert"] == "stop" else "secondary"):
+            close(t, t["stop"], "stop")
+        if b3.button("Sold at another price", key="o" + t["id"], use_container_width=True,
+                     type="primary" if stt["alert"] == "exit" else "secondary"):
+            other_price_dialog(t, stt["price"])
 
-    uni_path, uni_note = universe_path()
-    n_uni = universe_count(uni_path)
-    source_opts = list(PRESETS) + ["My symbols (type them)"]
-    if n_uni:
-        source_opts.insert(0, "Whole stock list (%d NSE stocks)" % n_uni)
-    source = st.radio("Which stocks", source_opts)
-    symbols = ""
-    limit = 0
-    preset_syms = None
-    if source in PRESETS:
-        rows, note = load_preset(PRESETS[source], datetime.date.today().isoformat())
-        if not rows:
-            st.error("Could not get the %s list (%s). Download %s in your browser and upload it into "
-                     "`trader/lists/` in the GitHub repository." % (source, note or "no answer", PRESETS[source]))
-        else:
-            industries = sorted({ind for _, ind in rows if ind})
-            pick = st.multiselect("Only these sectors (empty = all)", industries) if industries else []
-            preset_syms = [sym for sym, ind in rows if not pick or ind in pick]
-            st.caption("%d stocks in this list." % len(preset_syms))
-    elif source.startswith("My symbols"):
-        symbols = st.text_area("Type any NSE symbols, comma separated (the ones shown are only an example)",
-                               "RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK, SBIN, "
-                               "ITC, LT, AXISBANK, BHARTIARTL, M&M, TATASTEEL")
+    # new picks
+    if phase in ("closed", "pre"):
+        pass
+    elif done:
+        html(ui.done_card(why, counts))
     else:
-        limit = st.number_input("Scan only the first N (0 = all; the whole list takes a few minutes)",
-                                min_value=0, value=0, step=100)
-
-    min_price = st.number_input("Minimum price (\u20b9)", min_value=0.0, value=50.0, step=10.0)
-    if is_orb:
-        or_minutes = st.selectbox("Opening range (minutes)", [15, 30, 5, 10, 60], index=0)
-        at = st.text_input("Cut the clock at (HH:MM IST, empty = now)", "")
-    else:
-        min_volume = st.number_input("Minimum volume (shares)", min_value=0, value=500000, step=100000)
-    go = st.button("Run scan", type="primary", use_container_width=True)
-
-if not n_uni:
-    st.info("No NSE stock list yet (NSE refused this server), so you can scan symbols you type. To scan all of "
-            "NSE: download EQUITY_L.csv from nsearchives.nseindia.com/content/equities/EQUITY_L.csv in your "
-            "browser and upload it into a `trader` folder in this app's GitHub repository. No Python needed.")
-    if uni_note:
-        with st.expander("Why"):
-            st.code(uni_note)
-
-if go:
-    args = ["orb" if is_orb else "daily", "--min-price", str(min_price)]
-    if source in PRESETS:
-        if not preset_syms:
-            st.warning("That list is empty: pick another list or fewer sector filters.")
-            st.stop()
-        args += ["--symbols", ",".join(preset_syms)]
-    elif source.startswith("My symbols"):
-        syms = ",".join(s.strip().upper() for s in symbols.replace("\n", ",").split(",") if s.strip())
+        syms, note = symbols_for(source, typed, day.isoformat())
         if not syms:
-            st.warning("Type at least one symbol.")
-            st.stop()
-        args += ["--symbols", syms]
-    else:
-        args += ["--universe", uni_path]
-        if limit:
-            args += ["--limit", str(int(limit))]
-    if is_orb:
-        args += ["--or-minutes", str(or_minutes)]
-        if at.strip():
-            args += ["--at", at.strip()]
-    else:
-        args += ["--min-volume", str(int(min_volume))]
-    minute_key = now_ist.strftime("%Y%m%d%H") + str(now_ist.minute // 4)
-    with st.spinner("Scanning... a big list can take a few minutes."):
-        doc, err = cached_scan(tuple(args), minute_key)
-    if doc is None:
-        st.error(err.splitlines()[-1] if err else "The scan could not run.")
-    else:
-        c = doc.get("counts", {})
-        cols = st.columns(4)
-        cols[0].metric("Stocks asked for", doc.get("universe", 0))
-        cols[1].metric("Charts usable", doc.get("scanned", 0))
-        cols[2].metric("Failed / no data", doc.get("failed", 0))
-        cols[3].metric("Matched a rule", len(doc.get("hits", [])))
-        st.write("Data as of **%s**." % doc.get("as_of", ""))
-        if doc.get("unconfirmed"):
-            st.warning("Partial: %d candidates were not checked against real highs and lows." % doc["unconfirmed"])
-        rows = hits_table(doc)
-        if rows:
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-            st.download_button("Download watchlist.json (for /trader-news and /trader-entry)",
-                               json.dumps(doc, indent=2), file_name="watchlist.json", mime="application/json")
+            st.error("Could not get the stock list (%s). See README: upload the list file into trader/lists/ "
+                     "in the GitHub repository, or choose another list." % (note or "empty"))
         else:
-            st.write("Nothing matched the rule.")
-        if err:
-            with st.expander("Notes from the scanner"):
-                st.code(err)
+            with st.spinner("Scanning %d stocks..." % len(syms)):
+                daily, _ = daily_data(tuple(syms), day.isoformat())
+                inrange = []
+                for s in syms:
+                    m = (daily.get(s) or {}).get("meta") or {}
+                    p = m.get("regularMarketPrice")
+                    if p and min_price <= p <= max_price:
+                        inrange.append((-(p * (m.get("regularMarketVolume") or 0)), s))
+                inrange = [s for _, s in sorted(inrange)][:250]
+                spark, _ = spark_5m(tuple(inrange), key) if inrange else ({}, {})
+                cands = engine.stage_one(spark, now, CFG)
+                cands = [s for s in inrange if s in set(cands)][:25]
+                results = []
+                for s in cands:
+                    series = chart(s, key)
+                    if not series:
+                        continue
+                    closes = engine.closes_before(daily.get(s) or {}, day)
+                    r = engine.analyse(s, series, closes, nifty, now, CFG)
+                    if r and r["kind"] == "pick":
+                        r = engine.analyse(s, series, closes, nifty, now, CFG, news_flag=news(s, now.hour))
+                    results.append(r)
+                traded = {t["symbol"] for t in journal.today(data, mode, day)}
+                for r in results:
+                    if r and r["kind"] == "pick" and r["symbol"] in traded:
+                        r.update(kind="skip", reason="You already traded it today")
+                picks, watch, skipped = engine.rank(results)
+            html('<div class="v1sec">Today\'s top picks</div>')
+            if not picks:
+                st.write("No stock passes every rule right now. No signal means no trade.")
+            for k, r in enumerate(picks):
+                if k == 0:
+                    html(ui.pick_card(r))
+                else:
+                    html(ui.pick_row(r))
+                    with st.expander("Details: %s" % r["symbol"]):
+                        html(ui.pick_card(r))
+                if phase == "open" and st.button("I took this trade: %s" % r["symbol"], key="took" + r["symbol"],
+                                                 type="primary", use_container_width=True):
+                    took_dialog(r)
+            if watch:
+                html('<div class="v1sec">Getting close</div>')
+                html(ui.watch_rows(watch))
+            with st.expander("Skipped today: %d stocks" % len(skipped)):
+                html(ui.skipped_rows(skipped) or '<span class="v1mut">None yet.</span>')
+            st.caption("Scanned %d stocks priced \u20b9%g\u2013%g from %s; %d had a full check."
+                       % (len(inrange), min_price, max_price, source, len(cands)))
 
-st.divider()
-st.caption("Next steps happen on your own device, not here: check the news, time the entry, set the stop and "
-           "size the trade with the day-trader-skill-india pack. This page never places orders and never "
-           "stores broker logins.")
+    # results
+    html('<div class="v1sec">My results (%s)</div>' % ("practice" if mode == "paper" else "real money"))
+    html(ui.results_card(journal.results(data, mode), mode))
+    html('<div class="v1mut" style="text-align:center;margin-top:12px">A pick matches rules, it is not a promise. '
+         'Free Yahoo data can lag. Not financial advice.</div>')
+
+
+run_every = 300 if auto else None
+if hasattr(st, "fragment") and run_every:
+    st.fragment(run_every=run_every)(page)()
+else:
+    page()
+
+# ---------------------------------------------------------------- journal backup (outside the auto-refresh)
+with st.expander("Journal backup"):
+    data = load_journal()
+    st.download_button("Download my journal", json.dumps(data, indent=1), file_name="journal.json",
+                       mime="application/json")
+    up = st.file_uploader("Restore a journal file", type=["json"])
+    if up is not None and st.button("Restore it"):
+        try:
+            doc = json.loads(up.getvalue().decode("utf-8"))
+            if not isinstance(doc.get("trades"), list):
+                raise ValueError
+            save_journal(doc, "Restore journal")
+            st.success("Journal restored.")
+        except (ValueError, AttributeError):
+            st.error("That file is not a journal from this app.")
