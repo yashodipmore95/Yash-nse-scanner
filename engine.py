@@ -80,6 +80,8 @@ WEAK_REASON = {
     "trend": "against its longer trend",
     "room": "resistance just above",
     "market": "market falling",
+    "inplay": "not much trading interest today",
+    "early": "late in the day",
 }
 WEAK_REASON_SHORT = dict(WEAK_REASON, volume="weak selling", vwap="above the day's average price",
                          relative="stronger than the market", room="support just below", market="market rising")
@@ -450,7 +452,7 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
         reason = "Afternoon: only strong signals (8+) count; this one scored %d" % score
     if reason is None and score < 6:
         weakest = min((p / mx, k) for k, _, p, mx in factors)[1]
-        reason = "Score %d: %s" % (score, (WEAK_REASON if long else WEAK_REASON_SHORT)[weakest])
+        reason = "Score %d: %s" % (score, (WEAK_REASON if long else WEAK_REASON_SHORT).get(weakest, "weak signal"))
     signal_reason = reason            # how it looked AT the breakout (None = it was a valid signal then)
 
     # what happened after the breakout: whichever of stop or target came FIRST

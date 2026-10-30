@@ -77,6 +77,20 @@ class Money(unittest.TestCase):
 
 
 class Analyse(unittest.TestCase):
+    def test_every_factor_has_a_plain_reason(self):
+        for key, _, _ in engine.FACTORS:
+            self.assertIn(key, engine.WEAK_REASON, key)
+            self.assertIn(key, engine.WEAK_REASON_SHORT, key)
+
+    def test_low_score_where_in_play_is_the_weakest(self):
+        rows = [(DAY, "09:15", 300.5, 302.0, 299.0, 301.0, 50000), (DAY, "09:20", 301.0, 302.5, 300.0, 301.5, 30000),
+                (DAY, "09:25", 301.5, 302.0, 300.5, 301.8, 25000), (DAY, "09:30", 301.8, 302.4, 301.5, 302.2, 90000),
+                (DAY, "09:35", 302.3, 302.8, 302.2, 302.55, 10000)]
+        r = engine.analyse("THIN", series(rows), [320.0] * 25, nifty({"09:30": 24900.0, "09:35": 24880.0}), NOW,
+                           news_flag="")
+        self.assertEqual(r["kind"], "skip")
+        self.assertTrue(r["reason"].startswith("Score "), r["reason"])
+
     def test_strong_buy(self):
         r = engine.analyse("ACMEAUTO", breakout_stock(), DAILY, nifty(), NOW, news_flag="")
         self.assertEqual((r["kind"], r["side"], r["reason"]), ("pick", "buy", None))
