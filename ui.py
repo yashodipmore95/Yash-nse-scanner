@@ -178,6 +178,19 @@ def sector_tiles(sectors):
             'gap:6px">%s</div>' % "".join(cells))
 
 
+def vix_chip(vix):
+    if not vix:
+        return ""
+    level, chg = vix
+    mood = engine.vix_mood(level)
+    col = {"calm": "b", "normal": "g", "high": "r"}[mood[0]]
+    return ('<div class="v1card" style="padding:8px 12px"><div class="v1row"><span><b>India VIX %.2f</b>%s</span>'
+            '<span class="v1pill" style="background:var(--bg-%s);color:var(--%s)">%s</span></div>'
+            '<div class="v1mut">%s</div></div>'
+            % (level, (" <span class='v1mut'>(%+.1f%% today)</span>" % chg) if chg is not None else "", col, col,
+               mood[0].title(), esc(mood[1])))
+
+
 def breadth_bar(up, down):
     if up + down == 0:
         return ""
@@ -213,8 +226,8 @@ def readiness_card(ready):
             % ("g" if done == 4 else "a" if done >= 2 else "r", done, rows, msg))
 
 
-def lab_card(rows):
-    if not any(y[0] or n[0] for _, _, y, n in rows):
+def lab_card(rows, exits=None):
+    if not any(y[0] or n[0] for _, _, y, n in rows) and not exits:
         return ""
 
     def cell(pair):
@@ -222,9 +235,20 @@ def lab_card(rows):
         return "%d%% of %d" % (w, n) if n else "no data yet"
     body = "".join('<div style="font-size:12px;margin:4px 0"><b>%s</b>: %s <span class="v1mut">&middot; %s: %s</span>'
                    '</div>' % (esc(y_lab), cell(y), esc(n_lab), cell(n)) for y_lab, n_lab, y, n in rows)
+    ex = ""
+    if exits:
+        def line(name, d):
+            return ('<div class="v1row" style="font-size:12px;margin:2px 0"><span>%s</span><span>'
+                    '<b style="color:var(--%s)">%s</b> <span class="v1mut">&middot; %d%% wins</span></span></div>'
+                    % (name, "g" if d["total"] >= 0 else "r", engine.rupees(d["total"], True), d["win_rate"]))
+        ex = ('<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:6px"><div class="v1mut">'
+              'Exit test on %d finished days of signals</div>%s%s%s</div>'
+              % (exits["count"], line("Normal exits (now)", exits["normal"]),
+                 line("Exit on a close below VWAP", exits["vwap_exit"]),
+                 line("Trail with VWAP after +1&times; risk", exits["vwap_trail"])))
     return ('<div class="v1card"><div class="v1row"><b>Filter lab</b><span class="v1mut">win rate of all signals'
-            '</span></div>%s<div class="v1mut" style="margin-top:4px">After 3&ndash;4 weeks, a clear gap shows which '
-            'extra rule is worth turning on.</div></div>' % body)
+            '</span></div>%s%s<div class="v1mut" style="margin-top:4px">After 3&ndash;4 weeks, a clear gap shows which '
+            'extra rule or exit is worth turning on.</div></div>' % (body, ex))
 
 
 def pick_row(r):

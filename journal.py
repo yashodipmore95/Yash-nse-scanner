@@ -253,17 +253,31 @@ def add_signal(data, pick, cfg=None):
     return data, True
 
 
+def pending_symbols(data):
+    """Symbols whose signals still need an outcome or the end-of-day VWAP exit test."""
+    return sorted({x["symbol"] for x in data.get("signals", []) if not x.get("outcome") or not x.get("alt")})
+
+
 def settle_signals(data, charts, now, cfg=None):
-    """Fill in the outcome of open signals from `charts` {symbol: series}. -> (data, changed)."""
+    """Fill in the outcome of open signals from `charts` {symbol: series}, and once the day is over the
+    filter-lab VWAP exits. -> (data, changed)."""
     changed = False
     out = []
     for x in data.get("signals", []):
-        if x.get("outcome") is None and x["symbol"] in charts:
-            res = engine.evaluate_signal(x, charts[x["symbol"]], now, cfg)
-            if res:
-                x = dict(x, outcome=res[0], exit=round(res[1], 2),
-                         net=engine.net(x["side"], max(x["qty"], 1), x["entry"], res[1]))
-                changed = True
+        if x["symbol"] in charts:
+            if x.get("outcome") is None:
+                res = engine.evaluate_signal(x, charts[x["symbol"]], now, cfg)
+                if res:
+                    x = dict(x, outcome=res[0], exit=round(res[1], 2),
+                             net=engine.net(x["side"], max(x["qty"], 1), x["entry"], res[1]))
+                    changed = True
+            if x.get("outcome") and not x.get("alt"):
+                alt = engine.evaluate_variants(x, charts[x["symbol"]], now, cfg)
+                if alt:
+                    x = dict(x, alt={k: {"how": h, "exit": round(p, 2),
+                                         "net": engine.net(x["side"], max(x["qty"], 1), x["entry"], p)}
+                                     for k, (h, p) in alt.items()})
+                    changed = True
         out.append(x)
     if changed:
         data = dict(data)
@@ -285,7 +299,11 @@ def signal_stats(data):
 
 
 LAB = [("before_11", "Breakout before 11 AM", "after 11 AM"), ("in_play", "In play (2\u00d7 volume)", "normal volume"),
-       ("trend_rising", "20-day average rising", "not rising"), ("sector_up", "Sector moving the same way", "sector not")]
+       ("trend_rising", "20-day average rising", "not rising"), ("sector_up", "Sector moving the same way", "sector not"),
+       ("nr7", "Yesterday was NR7 (narrowest of 7 days)", "not NR7"),
+       ("narrow_cpr", "Narrow CPR today", "normal or wide CPR"),
+       ("open_extreme", "Opened at the day's low (high for a short)", "did not"),
+       ("near_52w", "Within 5% of the 52-week high", "further away")]
 
 
 def lab_stats(data):
@@ -301,3 +319,16 @@ def lab_stats(data):
             return (len(xs), round(100.0 * sum(1 for x in xs if x["net"] > 0) / len(xs)) if xs else None)
         out.append((yes_label, no_label, wr(yes), wr(no)))
     return out
+
+
+def exit_test(data):
+    """Normal exits versus the two VWAP exits, on signals where all three are known."""
+    xs = [x for x in data.get("signals", []) if x.get("outcome") and x.get("alt")]
+
+    def summary(nets):
+        return {"total": round(sum(nets), 2), "win_rate": round(100.0 * sum(1 for n in nets if n > 0) / len(nets))}
+    if not xs:
+        return None
+    return {"count": len(xs), "normal": summary([x["net"] for x in xs]),
+            "vwap_exit": summary([x["alt"]["vwap_exit"]["net"] for x in xs]),
+            "vwap_trail": summary([x["alt"]["vwap_trail"]["net"] for x in xs])}

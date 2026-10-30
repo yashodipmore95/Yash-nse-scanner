@@ -218,6 +218,14 @@ def sectors(key):
         return {}
 
 
+@st.cache_data(ttl=240, show_spinner=False)
+def vix(key):
+    try:
+        return engine.fetch_vix()
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def industry_map(day):
     rows, _ = lists.load_preset("ind_nifty500list.csv")
@@ -355,7 +363,7 @@ def track_signals(data, allpicks, now, key):
         if r.get("score") is not None and r.get("qty", 0) >= 1:
             data, c = journal.add_signal(data, r, CFG)
             changed = changed or c
-    pending = sorted({x["symbol"] for x in data.get("signals", []) if not x.get("outcome")})[:15]
+    pending = journal.pending_symbols(data)[:15]
     charts = {s_: chart(s_, key) for s_ in pending}
     data, c = journal.settle_signals(data, {k: v for k, v in charts.items() if v}, now, CFG)
     if changed or c:
@@ -478,6 +486,7 @@ def page():
         with st.spinner("Updating..."):
             res = scan_market(now, day, key, key30, nifty, data)
             data = track_signals(load_journal(), res["allpicks"], now, key)
+        html(ui.vix_chip(vix(key)))
         html(ui.sector_tiles(res["sectors"]))
         html(ui.breadth_bar(res["up"], res["down"]))
     picks, watch, skipped = res["picks"], res["watch"], res["skipped"]
@@ -539,7 +548,7 @@ def results_section(data):
         html(ui.readiness_card(res["ready"]))
     html(ui.results_card(res, mode))
     html(ui.signals_card(journal.signal_stats(data)))
-    html(ui.lab_card(journal.lab_stats(data)))
+    html(ui.lab_card(journal.lab_stats(data), journal.exit_test(data)))
 
 
 _now = engine.now_ist()

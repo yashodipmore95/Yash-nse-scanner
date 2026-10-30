@@ -128,6 +128,71 @@ class Analyse(unittest.TestCase):
         self.assertEqual(r["kind"], "pick")                           # weak factors do not kill it
         self.assertEqual((r["raw_score"], r["score"]), (10, 8))
 
+    def test_new_lab_fields(self):
+        d = [(DAY - datetime.timedelta(days=k), 10.0 + k, 8.0, 9.0, 1) for k in range(8, 0, -1)]
+        self.assertTrue(engine.is_nr7(d))                                      # ranges shrink: last is smallest
+        self.assertFalse(engine.is_nr7(d[:-1] + [(PREV, 20.0, 8.0, 9.0, 1)]))
+        self.assertIsNone(engine.is_nr7(d[:3]))
+        p, lo, hi, w = engine.cpr(305.0, 299.5, 300.0)
+        self.assertAlmostEqual(p, 301.5)
+        self.assertAlmostEqual(lo, 300.75)                                   # top and bottom: 300.75 and 302.25
+        self.assertAlmostEqual(hi, 302.25)
+        self.assertAlmostEqual(w, 0.4975, places=3)                          # 1.50 / 301.50: not narrow
+        self.assertLess(engine.cpr(301.0, 299.0, 300.0)[3], 0.25)             # a quiet day: narrow
+        s_ = breakout_stock()
+        s_["meta"] = {"fiftyTwoWeekHigh": 315.0}
+        r = engine.analyse("X", s_, DAILY, nifty(), NOW, news_flag="")
+        lab = r["lab"]
+        self.assertEqual((lab["near_52w"], lab["narrow_cpr"], lab["open_extreme"]), (True, False, False))
+        self.assertIsNone(lab["nr7"])                                          # no daily chart given
+        s_["meta"] = {"fiftyTwoWeekHigh": 400.0}
+        self.assertFalse(engine.analyse("X", s_, DAILY, nifty(), NOW, news_flag="")["lab"]["near_52w"])
+        self.assertEqual(engine.vix_mood(12.1)[0], "calm")
+        self.assertEqual(engine.vix_mood(15.0)[0], "normal")
+        self.assertEqual(engine.vix_mood(21.0)[0], "high")
+        names = [row[0] for row in journal.lab_stats(journal.empty())]
+        self.assertIn("Yesterday was NR7 (narrowest of 7 days)", names)
+        self.assertEqual(len(names), 8)
+
+    def test_vwap_must_pass(self):
+        rows = flat_day(PREV, 300.0)
+        rows += [(DAY, "09:15", 300.5, 302.0, 299.0, 301.0, 50000), (DAY, "09:20", 301.0, 302.5, 300.0, 301.5, 30000),
+                 (DAY, "09:25", 301.5, 302.0, 300.5, 301.8, 25000),
+                 (DAY, "09:30", 301.8, 330.0, 301.0, 302.0, 900000),     # a huge spike, sold off: VWAP jumps up
+                 (DAY, "09:35", 302.3, 304.2, 302.2, 304.0, 60000)]
+        r = engine.analyse("SPIKE", series(rows), DAILY, nifty(), NOW, news_flag="")
+        self.assertEqual(r["kind"], "skip")
+        self.assertIn("below the day's average price (VWAP", r["reason"])
+        self.assertIn(("vwap", "Above VWAP", False), r["checks"])
+        ok = engine.analyse("ACMEAUTO", breakout_stock(), DAILY, nifty(), NOW, news_flag="")
+        self.assertIn(("vwap", "Above VWAP", True), ok["checks"])
+
+    def test_vwap_exit_variants(self):
+        pick = engine.analyse("ACMEAUTO", breakout_stock(), DAILY, nifty(), NOW, news_flag="")
+        data, _ = journal.add_signal(journal.empty(), pick)
+        sig = data["signals"][0]                       # entry 304.00, stop 300.75, target 310.50, lock 307.25
+        rows = [(DAY, "09:40", 304.0, 307.6, 303.9, 307.4, 40000), (DAY, "09:45", 307.4, 309.0, 307.0, 308.8, 40000),
+                (DAY, "09:50", 308.8, 309.5, 305.0, 305.2, 40000)]
+        t = DT.combine(DAY, datetime.time(9, 55))
+        while t.time() < datetime.time(15, 30):
+            rows.append((DAY, t.strftime("%H:%M"), 305.0, 305.5, 304.5, 305.0, 1000))
+            t += datetime.timedelta(minutes=5)
+        s = breakout_stock(rows)
+        self.assertIsNone(engine.evaluate_variants(sig, s, DT.combine(DAY, datetime.time(12, 0))))   # day not over
+        v = engine.evaluate_variants(sig, s, DT.combine(DAY, datetime.time(15, 31)))
+        self.assertEqual(v["vwap_exit"][0], "close")            # never closed below VWAP, never hit stop or target
+        self.assertEqual(v["vwap_trail"][0], "close")
+        self.assertEqual(engine.evaluate_signal(sig, s, DT.combine(DAY, datetime.time(15, 31)))[0], "time")
+        data, ch = journal.settle_signals(data, {"ACMEAUTO": s}, DT.combine(DAY, datetime.time(15, 31)))
+        x = data["signals"][0]
+        self.assertTrue(ch and x["outcome"] and x["alt"])
+        ex = journal.exit_test(data)
+        self.assertEqual(ex["count"], 1)
+        # a fall below VWAP: the VWAP exit gets out at that candle's close
+        drop = [(DAY, "09:40", 304.0, 304.5, 301.5, 302.0, 400000)] + rows[1:]
+        v = engine.evaluate_variants(sig, breakout_stock(drop), DT.combine(DAY, datetime.time(15, 31)))
+        self.assertEqual(v["vwap_exit"], ("vwap", 302.0))
+
     def test_range_size_and_afternoon(self):
         def daily_chart(rng):
             rows = []

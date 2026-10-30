@@ -32,6 +32,8 @@ requirements.txt          streamlit>=1.37
   After 1 PM only 8+ counts.
 - Range size: the 9:15–9:30 range must be 0.25× to 1.2× the stock's normal daily move (14-day
   ATR); a range outside that is skipped.
+- VWAP must pass: a BUY's breakout candle must close above the day's average price (VWAP), a SELL's
+  below it. Otherwise the stock is skipped, whatever its score.
 - Always skipped: results or big news in the headlines, a big opening gap, already up more than
   3%, a signal outside 9:30 AM–2:30 PM, too risky for your capital, outside your price range,
   price already moved on, hit its stop or target, or a stock you already traded today.
@@ -70,6 +72,8 @@ own time is recorded in the signal tracker and the filter lab, even if the page 
   stock's sector (from the Nifty 500 list's industry; financial services use the Bank index) is
   moving its way.
 - Market breadth: how many of the scanned stocks are up versus down today.
+- India VIX: the market's fear gauge with a rough guide (calm under 13, normal 13 to 18, high above
+  18: wider swings, so consider a smaller size or fewer trades). A guide, not a rule.
 - Refresh: once a minute before 9:15 AM on a trading day (so it starts by itself), every 30
   seconds from 9:15 AM to 3:30 PM, off after the close and on weekends and NSE holidays. The badge
   at the top shows which.
@@ -81,8 +85,14 @@ own time is recorded in the signal tracker and the filter lab, even if the page 
 - When you close a trade, one tap says how it went: Followed plan, Entered late, Moved stop-loss,
   Exited early, Skipped stop-loss or Other mistake. Your results show your most common mistake.
 - Filter lab: every signal also records whether it came before 11 AM, was in play, had a rising
-  20-day average and had its sector moving the same way. Its win rate with and without each
+  20-day average, had its sector moving the same way, came the day after an NR7 day (narrowest range
+  of 7), had a narrow CPR (central pivot range under 0.25% of price, from yesterday's high, low and
+  close), opened at the day's low (high for a short) and was within 5% of its 52-week high. Its win rate with and without each
   appears here, so you can see which extra rule is worth turning on.
+- Exit test (in the filter lab, from the end of each day): every signal is also replayed with two
+  VWAP exits, (1) exit at the close of any candle on the wrong side of VWAP, and (2) after +1× risk,
+  no target and trail with VWAP (never worse than the buy price), next to the normal exits. After a
+  few weeks it shows which exit made more money on your signals.
 
 - Running total after charges, win rate, average win and loss.
 - Discipline: how often you followed your rules. Slippage: your real entry versus the signal

@@ -85,6 +85,7 @@ WEAK_REASON = {
 }
 WEAK_REASON_SHORT = dict(WEAK_REASON, volume="weak selling", vwap="above the day's average price",
                          relative="stronger than the market", room="support just below", market="market rising")
+DEFAULTS.update({"narrow_cpr_pct": 0.25, "near_52w_pct": 5.0})
 DEFAULTS.update({"range_min": 0.25, "range_max": 1.2, "early_until": datetime.time(11, 0),
                  "strong_only_after": datetime.time(13, 0)})
 
@@ -286,6 +287,23 @@ def atr(rows, n=14):
     return sum(trs) / n
 
 
+def is_nr7(rows):
+    """True when the last full session's range (high - low) was the smallest of the last 7 (None if too short)."""
+    if len(rows) < 7:
+        return None
+    ranges = [h - l for _, h, l, _, _ in rows[-7:]]
+    return ranges[-1] <= min(ranges)
+
+
+def cpr(high, low, close):
+    """Central pivot range from yesterday's high, low and close: (pivot, bottom, top, width % of pivot)."""
+    p = (high + low + close) / 3.0
+    bc = (high + low) / 2.0
+    tc = 2 * p - bc
+    lo, hi = min(bc, tc), max(bc, tc)
+    return p, lo, hi, (hi - lo) / p * 100.0
+
+
 def sma_rising(closes, n=20, back=5):
     """True when the n-day average today is above where it was `back` sessions ago (None if too short)."""
     if len(closes) < n + back:
@@ -415,6 +433,17 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
     a14 = atr(rows)
     range_ratio = (or_high - or_low) / a14 if a14 else None
     edge_pct = round(edge, 2) if (s_chg is not None and n_chg is not None) else None
+    cp = cpr(max(x["h"] for x in ybars), min(x["l"] for x in ybars), ybars[-1]["c"]) if ybars else None
+    tick = tick_size(bars[0]["o"])
+    upto = bars[:i + 1]
+    open_extreme = (min(x["l"] for x in upto) >= bars[0]["o"] - tick / 2.0) if long else \
+        (max(x["h"] for x in upto) <= bars[0]["o"] + tick / 2.0)
+    hi52 = ((series.get("meta") or {}).get("fiftyTwoWeekHigh") if long else
+            (series.get("meta") or {}).get("fiftyTwoWeekLow"))
+    near52 = None
+    if hi52:
+        near52 = (entry >= float(hi52) * (1 - c["near_52w_pct"] / 100.0)) if long else \
+            (entry <= float(hi52) * (1 + c["near_52w_pct"] / 100.0))
 
     # hard checks, in the order a trader reads them
     gap = pct(bars[0]["o"], prev_close)
@@ -434,6 +463,11 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
     elif too_far:
         reason = reason or ("Opened with a big gap" if gap is not None and abs(gap) > c["max_gap_pct"]
                             else "Already moved more than %g%% today" % c["max_extended_pct"])
+    vw_ok = None if not vw else ((b["c"] > vw) if long else (b["c"] < vw))
+    checks.append(("vwap", "Above VWAP" if long else "Below VWAP", vw_ok))
+    if vw_ok is False:
+        reason = reason or ("Closed below the day's average price (VWAP %.2f)" % vw if long
+                            else "Closed above the day's average price (VWAP %.2f)" % vw)
     if range_ratio is not None:
         okr = c["range_min"] <= range_ratio <= c["range_max"]
         checks.append(("range", "Range size okay", okr))
@@ -487,7 +521,12 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
                         None if sma_rising(daily or []) is None else not sma_rising(daily or [])),
                     "sector_up": None if not sector or sector[1] is None else (
                         sector[1] > 0 if long else sector[1] < 0),
-                    "range_ratio": round(range_ratio, 2) if range_ratio is not None else None},
+                    "range_ratio": round(range_ratio, 2) if range_ratio is not None else None,
+                    "nr7": is_nr7(rows) if rows else None,
+                    "narrow_cpr": (cp[3] < c["narrow_cpr_pct"]) if cp else None,
+                    "cpr_width": round(cp[3], 3) if cp else None,
+                    "open_extreme": open_extreme,
+                    "near_52w": near52},
                sector=sector)
     out["why"] = why_line(out)
     return out
@@ -665,6 +704,69 @@ def trade_status(trade, series, nifty, now, cfg=None, live=None):
     return st
 
 
+def evaluate_variants(sig, series, now, cfg=None):
+    """Filter-lab exits for a signal, once its day is over: {"vwap_exit": (how, price), "vwap_trail": (how, price)}.
+
+    vwap_exit   the normal plan, plus: exit at the close of any 5-minute candle that closes on the wrong
+                side of VWAP (below it for a buy)
+    vwap_trail  the normal stop until the price reaches 1x the risk; then no target, and exit at the
+                close of the first candle on the wrong side of VWAP (never worse than the buy price), or at
+                2:55 PM
+    None while the day is not over."""
+    c = dict(DEFAULTS)
+    c.update(cfg or {})
+    long = sig["side"] == "buy"
+    d = datetime.date.fromisoformat(sig["date"])
+    flat = datetime.datetime.combine(d, c["flat_by"])
+    if not (d < now.date() or now >= flat):
+        return None
+    t0 = datetime.datetime.fromisoformat(sig["time"])
+    allbars = day_bars(series or {}, d, now)
+    if not allbars:
+        return None
+    entry, stop, target = sig["entry"], sig["stop"], sig["target"]
+    risk = abs(entry - stop) or 0.01
+    lock = entry + risk if long else entry - risk
+    out = {}
+    for name in ("vwap_exit", "vwap_trail"):
+        pv = vol = 0.0
+        locked = False
+        res = None
+        for b in allbars:
+            if b["v"]:
+                pv += (b["h"] + b["l"] + b["c"]) / 3.0 * b["v"]
+                vol += b["v"]
+            if b["start"] < t0:
+                continue
+            vw = pv / vol if vol else None
+            end = b["start"] + BAR
+            wrong = vw is not None and ((b["c"] < vw) if long else (b["c"] > vw))
+            if name == "vwap_exit":
+                if (b["l"] <= stop) if long else (b["h"] >= stop):
+                    res = ("stop", stop)
+                elif (b["h"] >= target) if long else (b["l"] <= target):
+                    res = ("target", target)
+                elif wrong:
+                    res = ("vwap", b["c"])
+            else:
+                if not locked and ((b["l"] <= stop) if long else (b["h"] >= stop)):
+                    res = ("stop", stop)
+                elif locked and wrong:
+                    res = ("vwap", max(b["c"], entry) if long else min(b["c"], entry))
+                elif locked and ((b["l"] <= entry) if long else (b["h"] >= entry)):
+                    res = ("entry", entry)
+                elif (b["h"] >= lock) if long else (b["l"] <= lock):
+                    locked = True        # the trail starts from the next candle (order inside a candle is unknown)
+            if res is None and end >= flat:
+                res = ("close", b["c"])
+            if res:
+                break
+        if res is None:
+            res = ("close", allbars[-1]["c"])
+        out[name] = res
+    return out
+
+
 def evaluate_signal(sig, series, now, cfg=None):
     """How a recorded signal would have ended with the simple rules: stop or target first, else the
     time exit (no 0.5R move within the hour), else the 2:55 PM close. None while still undecided."""
@@ -778,6 +880,28 @@ def fetch_sectors():
         if price and prev:
             out[name] = round((float(price) / float(prev) - 1) * 100, 2)
     return out
+
+
+def fetch_vix():
+    """(India VIX level, % change today) from Yahoo's ^INDIAVIX, or None."""
+    data, _ = scan.fetch_spark(["^INDIAVIX"], "1d", "5m", 0.2)
+    sres = data.get("^INDIAVIX")
+    m = (sres or {}).get("meta") or {}
+    price, prev = m.get("regularMarketPrice"), m.get("chartPreviousClose") or m.get("previousClose")
+    if not price:
+        return None
+    return round(float(price), 2), (round((float(price) / float(prev) - 1) * 100, 1) if prev else None)
+
+
+def vix_mood(level):
+    """A rough guide, not a rule: calm under 13, normal 13 to 18, high above 18."""
+    if level is None:
+        return None
+    if level < 13:
+        return "calm", "Calm market: smaller moves, breakouts may lack follow-through."
+    if level <= 18:
+        return "normal", "Normal volatility."
+    return "high", "High volatility: wider swings. Consider a smaller size or fewer trades."
 
 
 def breadth(daily, spark, day, now):
