@@ -9,8 +9,11 @@ Not financial advice.
 """
 
 import datetime
+import hashlib
+import hmac
 import json
 import os
+import time
 
 import streamlit as st
 
@@ -38,16 +41,54 @@ def secret(name):
     return os.environ.get(name) or None
 
 
-# ---------------------------------------------------------------- password
+# ---------------------------------------------------------------- password (remembered for 1 hour of inactivity)
+
+LOGIN_SECONDS = 3600
+
+
+def _sign(exp, pw):
+    return hmac.new(pw.encode("utf-8"), str(exp).encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+
+
+def _token(pw):
+    exp = int(time.time()) + LOGIN_SECONDS
+    return "%d.%s" % (exp, _sign(exp, pw))
+
+
+def _expiry(tok, pw):
+    """Expiry (unix seconds) of a valid, unexpired login code, else None."""
+    try:
+        exp_s, sig = str(tok).split(".", 1)
+        exp = int(exp_s)
+    except (ValueError, AttributeError):
+        return None
+    if exp < time.time() or not hmac.compare_digest(sig, _sign(exp, pw)):
+        return None
+    return exp
+
+
+def renew_login():
+    """Keep the login code in the address bar fresh while the page is in use (every ~10 minutes)."""
+    pw = secret("APP_PASSWORD")
+    if not pw or not st.session_state.get("pw_ok"):
+        return
+    exp = _expiry(st.query_params.get("s"), pw)
+    if exp is None or exp - time.time() < LOGIN_SECONDS - 600:
+        st.query_params["s"] = _token(pw)
+
 
 def password_ok():
     pw = secret("APP_PASSWORD")
     if not pw or st.session_state.get("pw_ok"):
         return True
+    if _expiry(st.query_params.get("s"), pw):          # same address, used within the last hour
+        st.session_state["pw_ok"] = True
+        return True
     st.title("\U0001F4C8 NSE scanner")
     typed = st.text_input("Password", type="password")
-    if typed and typed == pw:
+    if typed and hmac.compare_digest(typed, pw):
         st.session_state["pw_ok"] = True
+        st.query_params["s"] = _token(pw)
         st.rerun()
     elif typed:
         st.error("Wrong password.")
@@ -56,6 +97,7 @@ def password_ok():
 
 if not password_ok():
     st.stop()
+renew_login()
 
 
 # ---------------------------------------------------------------- journal storage
@@ -296,7 +338,10 @@ def focus(t, now, key, key30, nifty, phase):
                      type="primary", use_container_width=True):
             save_journal(journal.replace(load_journal(), dict(t, stop=stt["new_stop"], stop_moved_at=now.replace(
                 microsecond=0).isoformat())), "Move stop %s" % t["symbol"])
-            st.rerun()
+            try:
+                st.rerun(scope="fragment")
+            except TypeError:  # older Streamlit
+                st.rerun()
     st.caption("How did it end?" if stt["alert"] in ("stop", "target", "exit") else "Closed it already?")
     followed = st.toggle("I followed my rules on this trade", value=True, key="f" + t["id"])
     b1, b2, b3 = st.columns(3)
@@ -311,17 +356,16 @@ def focus(t, now, key, key30, nifty, phase):
         other_price_dialog(t, stt["price"], followed)
 
 
-def page():
-    now = engine.now_ist()
-    day = now.date()
+def keys(now):
     bump = st.session_state.get("bump", 0)
     key = "%s-%d" % (engine.candle_key(now), bump)                 # new candles: 20 s after each 5-minute close
     key30 = "%s-%d" % (now.strftime("%Y%m%d%H%M") + str(now.second // 30), bump)   # live prices: every 30 s
-    data = load_journal()
-    phase, phase_msg = engine.market_phase(now)
+    return key, key30
 
-    html('<div class="v1row"><b style="font-size:20px">&#128200; NSE scanner</b><span class="v1mut">&#8635; %s</span>'
-         '</div>' % now.strftime("%I:%M:%S %p").lstrip("0"))
+
+def header(now, clock=True):
+    html('<div class="v1row"><b style="font-size:20px">&#128200; NSE scanner</b><span class="v1mut">%s</span>'
+         '</div>' % ("&#8635; " + now.strftime("%I:%M:%S %p").lstrip("0") if clock else ""))
     html('<span class="v1pill" style="background:var(--bg-b);color:var(--b)">%s</span>'
          '<span class="v1pill" style="border:1px solid var(--line)">%s capital</span>'
          '<span class="v1pill" style="border:1px solid var(--line)">Max loss %s</span>'
@@ -334,6 +378,36 @@ def page():
         st.caption("Trades are kept only while this page is open (no GITHUB_TOKEN / JOURNAL_REPO in Secrets). "
                    "Use the download button at the bottom to keep them.")
 
+
+def focus_panel():
+    """Focus mode: only this panel refreshes. No market scan runs while a trade is open."""
+    renew_login()
+    now = engine.now_ist()
+    key, key30 = keys(now)
+    phase, _ = engine.market_phase(now)
+    opens = journal.open_trades(load_journal(), mode)
+    if not opens:                                   # closed in another tab: back to the full page
+        st.rerun()
+    nifty = chart(engine.NIFTY, key) if phase in ("open", "forming", "after") else None
+    html('<div class="v1mut" style="text-align:right">&#8635; Updated %s</div>' % now.strftime("%I:%M:%S %p").lstrip("0"))
+    for t in opens:
+        focus(t, now, key, key30, nifty, phase)
+
+
+def page():
+    renew_login()
+    now = engine.now_ist()
+    day = now.date()
+    key, key30 = keys(now)
+    data = load_journal()
+    phase, phase_msg = engine.market_phase(now)
+    header(now)
+    html('<span class="v1pill" style="background:var(--bg-b);color:var(--b)">%s</span>'
+         '<span class="v1pill" style="border:1px solid var(--line)">%s capital</span>'
+         '<span class="v1pill" style="border:1px solid var(--line)">Max loss %s</span>'
+         '<span class="v1pill" style="border:1px solid var(--line)">&#8377;%g&ndash;%g</span>'
+         % ("Practice mode" if mode == "paper" else "Real money", engine.rupees(capital),
+            engine.rupees(max_loss), min_price, max_price))
     nifty = chart(engine.NIFTY, key) if phase in ("open", "forming", "after") else None
     n_today = [b["c"] for b in engine.day_bars(nifty or {}, day, now)]
     done, why, counts = journal.guard(data, mode, day, CFG)
@@ -351,10 +425,8 @@ def page():
                 note, allpicks = allpicks, []
             data = track_signals(load_journal(), allpicks, now, key)
 
-    opens = journal.open_trades(data, mode)
-    if opens:                                                       # focus mode: only the open trade(s)
-        for t in opens:
-            focus(t, now, key, key30, nifty, phase)
+    if journal.open_trades(data, mode):            # a trade was just opened: switch to focus mode
+        st.rerun()
     elif phase in ("closed", "pre", "forming"):
         pass
     elif done:
@@ -394,18 +466,31 @@ def page():
         st.caption("Scanned %d stocks priced \u20b9%g\u2013%g from %s; %d had a full check."
                    % (scanned, min_price, max_price, source, checked))
 
-    html('<div class="v1sec">My results (%s)</div>' % ("practice" if mode == "paper" else "real money"))
-    html(ui.results_card(journal.results(data, mode), mode))
-    html(ui.signals_card(journal.signal_stats(data)))
+    results_section(data)
     html('<div class="v1mut" style="text-align:center;margin-top:12px">A pick matches rules, it is not a promise. '
          'Free Yahoo data can lag. Not financial advice.</div>')
 
 
+def results_section(data):
+    html('<div class="v1sec">My results (%s)</div>' % ("practice" if mode == "paper" else "real money"))
+    html(ui.results_card(journal.results(data, mode), mode))
+    html(ui.signals_card(journal.signal_stats(data)))
+
+
 run_every = 30 if auto else None
-if hasattr(st, "fragment") and run_every:
-    st.fragment(run_every=run_every)(page)()
+fragment = (lambda f: st.fragment(run_every=run_every)(f)) if (hasattr(st, "fragment") and run_every) else (lambda f: f)
+_now = engine.now_ist()
+_data = load_journal()
+if journal.open_trades(_data, mode):
+    # Focus mode: the header, day bar and results stay still; only the trade panel refreshes.
+    header(_now, clock=False)
+    _phase, _msg = engine.market_phase(_now)
+    _done, _why, _counts = journal.guard(_data, mode, _now.date(), CFG)
+    html(ui.day_strip(_counts, int(max_trades), []))
+    fragment(focus_panel)()
+    results_section(_data)
 else:
-    page()
+    fragment(page)()
 
 # ---------------------------------------------------------------- journal backup (outside the auto-refresh)
 with st.expander("Journal backup"):

@@ -40,6 +40,8 @@ requirements.txt          streamlit>=1.37
 
 ## While you are in a trade (focus mode)
 
+- While a trade is open, only the trade panel refreshes (every 30 seconds); the rest of the page
+  stays still and the market scan pauses until you close the trade.
 - After **I took this trade**, the page shows only that trade until you close it: live price,
   profit or loss, a progress bar from stop to target, a live chart since your entry, and a
   **Next** line that always says the one thing to do now.
@@ -118,6 +120,11 @@ streamlit run streamlit_app.py
 Tests (no internet needed): `python3 -m unittest discover -s tests`
 
 ## Good to know
+
+- Password: asked once, then remembered for 1 hour of inactivity through a login code in the
+  page's address (it renews itself while the page is open). Reloading, or coming back from the
+  Groww app, does not ask again within that hour. Don't share the address bar link: share the
+  plain app address instead. Changing APP_PASSWORD in Secrets cancels all login codes.
 
 - Keep the site password-protected. Yahoo's data is for personal use, and publishing buy or sell
   calls to others can count as investment advice under SEBI's rules.
