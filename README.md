@@ -20,6 +20,40 @@ tests/test_engine.py      offline tests on made-up data
 requirements.txt          streamlit>=1.37
 ```
 
+## The home page, top to bottom
+
+1. Header: refresh badge (60 s before 9:15, 30 s in market hours, off otherwise).
+2. Top 5 to watch: the best five right now with rating rings (blue = setup rating before the
+   breakout, green = signal score after it), with ▲ for a stock that moved up and NEW for a newcomer.
+   Before 9:30 it is a pre-market top 5 rated on daily closes.
+3. Market mood: one needle from India VIX, breadth and Nifty, with the sectors as a colour strip.
+4. ⚡ Get ready: watchlist stocks whose live price is past the buy price but whose candle has not
+   closed. A Now → Buy → Target bar (green below the buy price; amber, orange then red above it),
+   a countdown to the candle close, icon checks, and "I took this trade (early)" (saved with the tag
+   Early entry). The best one first, at most two backups.
+5. 🟢 Picks: confirmed signals, freshest first. Fresh: at most 0.2x the risk past the buy price and
+   under 15 minutes old. Late: reward:risk at the live price still 1.2 : 1 or better and under 30
+   minutes old (shares and reward recalculated). Missed: moved to Skipped, don't chase. Each fresh
+   card has a price ladder, icon checks, a risk vs reward row (lose / win / ratio, wins needed to break
+   even, share of capital, backtest win rate for that score once you have run the backtest), a copy box
+   and "I took this trade".
+6. 👁 Watchlist: stocks within 2% below their buy price that pass every advance check, by setup rating
+   (pinned first). Tap Details to open one (one at a time): countdown, bar, checks, plan, and the two
+   ways to buy (A wait for the close, B an advance stop-limit order that buys on touch).
+7. Folded lists: Finished today and Skipped right now.
+8. Bottom: icon legend, status messages, disclaimer.
+
+Setup rating (0-10, before the breakout): with the daily trend 2, 20-day average rising 1, in play so
+far 2 (1.5x) / 1 (1.2x), stronger than Nifty 1, sector moving the same way 1, range size okay 1, under
+half the ATR used 1, NR7 or narrow CPR 1. It ranks setups; it is not a win probability.
+
+## My progress page
+
+Side panel → Page → My progress: the four readiness rings, running total with the worst dip shaded,
+a 5-week calendar, a lose-small-win-big chart in R, win % by signal score and by entry time, how
+trades ended, mistakes and what they cost, charges vs profit, your buy price vs the signal, early vs
+confirmed entries, signals you took vs skipped, then all signals, the filter lab and the exit test.
+
 ## The rules it uses
 
 - Stocks: your chosen list (F&O stocks by default), priced between your min and max (₹100–500).
@@ -89,7 +123,7 @@ results stay positive after charges.
 Replays the scanner's exact rules on the last 60 days of 5-minute data (Yahoo's limit) for your
 most-traded stocks in range, with Groww charges, managing every trade the way the app does. It shows:
 the Phase 1 result "your way" (2 trades a day, one at a time) with a running-total line; a table of
-variants (old rules, retest entry, 30-minute range, stop below the breakout candle, half at 1.5x with a
+variants (buy on touch with an advance order, old rules, retest entry, 30-minute range, stop below the breakout candle, half at 1.5x with a
 3x trail, VWAP exit, VWAP trail); why breakouts were skipped; and filters with and without (RSI above
 60, MACD expanding, daily ADX above 20, and the filter-lab fields). The first run downloads about two
 charts per stock and takes a few minutes; results are kept for 12 hours. Limits: no slippage beyond

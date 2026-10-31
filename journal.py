@@ -75,7 +75,7 @@ def empty():
 
 # ---------------------------------------------------------------- trades
 
-def new_trade(pick_or_symbol, side, entry, stop, qty, mode, now, cfg=None):
+def new_trade(pick_or_symbol, side, entry, stop, qty, mode, now, cfg=None, early=False):
     """A trade record from what the user actually did. Raises JournalError with a plain message."""
     c = dict(engine.DEFAULTS)
     c.update(cfg or {})
@@ -102,7 +102,9 @@ def new_trade(pick_or_symbol, side, entry, stop, qty, mode, now, cfg=None):
             "first_stop": round(stop, 2), "qty": qty, "target": plan["target"], "lock": plan["lock"],
             "exit_by": exit_by.replace(microsecond=0).isoformat(), "status": "open",
             "score": None if isinstance(pick_or_symbol, str) else pick_or_symbol.get("score"),
-            "signal_entry": None if isinstance(pick_or_symbol, str) else pick_or_symbol.get("entry")}
+            "signal_entry": None if isinstance(pick_or_symbol, str) else pick_or_symbol.get("entry"),
+            "entry_type": "early" if early else "confirmed",
+            "rating": None if isinstance(pick_or_symbol, str) else pick_or_symbol.get("rating")}
 
 
 def slippage(trade):
@@ -229,11 +231,11 @@ def readiness(closed, total, asked, goal=50):
     wins = sum(1 for t in closed if t["net"] > 0)
     wr = 100.0 * wins / n if n else 0
     disc = 100.0 * sum(1 for t in asked if t["followed"]) / len(asked) if asked else 0
-    goals = [("%d practice trades" % goal, n >= goal, "%d of %d" % (n, goal)),
-             ("Positive total after charges", n > 0 and total > 0, engine.rupees(total, True)),
-             ("Win rate 50% or more", n > 0 and wr >= 50, "%d%%" % round(wr)),
-             ("Followed rules 90%+", bool(asked) and disc >= 90, "%d%%" % round(disc))]
-    return {"goals": goals, "done": sum(1 for _, ok, _ in goals if ok)}
+    goals = [("%d practice trades" % goal, n >= goal, "%d/%d" % (n, goal), min(1.0, n / float(goal))),
+             ("Positive total", n > 0 and total > 0, engine.rupees(total, True), 1.0 if total > 0 else 0.15),
+             ("Win rate 50%+", n > 0 and wr >= 50, "%d%%" % round(wr), min(1.0, wr / 50.0)),
+             ("Rules 90%+", bool(asked) and disc >= 90, "%d%%" % round(disc), min(1.0, disc / 90.0))]
+    return {"goals": goals, "done": sum(1 for g in goals if g[1])}
 
 
 # ---------------------------------------------------------------- every signal, tracked in the background
@@ -332,3 +334,68 @@ def exit_test(data):
     return {"count": len(xs), "normal": summary([x["net"] for x in xs]),
             "vwap_exit": summary([x["alt"]["vwap_exit"]["net"] for x in xs]),
             "vwap_trail": summary([x["alt"]["vwap_trail"]["net"] for x in xs])}
+
+
+def progress(data, mode, today):
+    """Everything the My progress page draws, from the closed trades of one mode."""
+    closed = closed_trades(data, mode)
+    out = {"count": len(closed)}
+
+    def wr(ts):
+        return round(100.0 * sum(1 for t in ts if t["net"] > 0) / len(ts)) if ts else None
+    days = {}
+    for t in closed:
+        days[t["date"]] = round(days.get(t["date"], 0.0) + t["net"], 2)
+    out["days"] = days
+    buckets = [0] * 6
+    for t in closed:
+        risk = abs(t["entry"] - t.get("first_stop", t["stop"])) or 0.01
+        gross_per_share = (t["exit"] - t["entry"]) if t["side"] == "buy" else (t["entry"] - t["exit"])
+        r = gross_per_share / risk
+        k = 0 if r <= -0.75 else 1 if r <= -0.25 else 2 if r < 0.25 else 3 if r < 0.75 else 4 if r < 1.5 else 5
+        buckets[k] += 1
+    out["r_buckets"] = buckets
+    by_score = [("6-7", [t for t in closed if (t.get("score") or 0) < 8]),
+                ("8", [t for t in closed if t.get("score") == 8]),
+                ("9-10", [t for t in closed if (t.get("score") or 0) >= 9])]
+    out["by_score"] = [(lab, wr(ts), len(ts)) for lab, ts in by_score]
+    hours = [("9:30", 9, 10, 30), ("10:30", 10, 11, 30), ("11:30", 11, 12, 30), ("12:30", 12, 13, 30),
+             ("1:30+", 13, 16, 30)]
+
+    def hm(t):
+        hh, mm = int(t["opened_at"][11:13]), int(t["opened_at"][14:16])
+        return hh * 60 + mm
+    out["by_hour"] = []
+    for lab, h0, h1, m in hours:
+        ts = [t for t in closed if h0 * 60 + m <= hm(t) < h1 * 60 + m] if lab != "9:30" else \
+            [t for t in closed if hm(t) < 10 * 60 + 30]
+        out["by_hour"].append((lab, wr(ts), len(ts)))
+    hows = {}
+    for t in closed:
+        hows[t.get("how") or "other"] = hows.get(t.get("how") or "other", 0) + 1
+    out["hows"] = hows
+    tags = {}
+    cost = 0.0
+    for t in closed:
+        tg = t.get("tag") or "Not recorded"
+        tags[tg] = tags.get(tg, 0) + 1
+        if t.get("tag") and t["tag"] != "Followed plan" and t["net"] < 0:
+            cost += t["net"]
+    out["tags"], out["mistake_cost"] = tags, round(cost, 2)
+    gross = 0.0
+    for t in closed:
+        per = (t["exit"] - t["entry"]) if t["side"] == "buy" else (t["entry"] - t["exit"])
+        gross += per * t["qty"]
+    out["gross"], out["net"] = round(gross, 2), round(sum(t["net"] for t in closed), 2)
+    out["charges"] = round(gross - out["net"], 2)
+    sl = [slippage(t) for t in closed if slippage(t) is not None]
+    out["slippage"], out["slippage_avg"] = sl, (round(sum(sl) / len(sl), 2) if sl else 0.0)
+    early = [t for t in closed if t.get("entry_type") == "early"]
+    conf = [t for t in closed if t.get("entry_type") != "early"]
+    out["entries"] = [("Early", wr(early), len(early)), ("Confirmed", wr(conf), len(conf))]
+    taken = {(t["symbol"], t["date"]) for t in data.get("trades", [])}
+    sigs = [x for x in data.get("signals", []) if x.get("outcome")]
+    took = [x for x in sigs if (x["symbol"], x["date"]) in taken]
+    skip = [x for x in sigs if (x["symbol"], x["date"]) not in taken]
+    out["took_vs_skip"] = [("Signals you took", wr(took), len(took)), ("Signals you skipped", wr(skip), len(skip))]
+    return out

@@ -24,6 +24,7 @@ IST_OPEN = datetime.time(9, 15)
 OR_BARS = 3                       # 9:15, 9:20, 9:25: the 15-minute opening range
 BAR = datetime.timedelta(minutes=5)
 NIFTY = "^NSEI"
+WATCH_PCT = 2.0          # watchlist: within 2% below the breakout price
 
 DEFAULTS = {
     "capital": 5000.0,
@@ -1038,8 +1039,8 @@ def closes_before(series, day):
     return out
 
 
-def stage_one(spark_5m, now, cfg=None):
-    """Symbols worth a full chart: a 5-minute close past the opening-range closes, or within 1% of it."""
+def stage_one(spark_5m, now, cfg=None, near_pct=WATCH_PCT):
+    """Symbols worth a full chart: a 5-minute close past the opening-range closes, or within near_pct % of it."""
     c = dict(DEFAULTS)
     c.update(cfg or {})
     day = now.date()
@@ -1052,7 +1053,159 @@ def stage_one(spark_5m, now, cfg=None):
         lo = min(b["c"] for b in bars[:OR_BARS])
         later = bars[OR_BARS:]
         last = later[-1]["c"]
-        if any(b["c"] > hi for b in later) or last >= hi * 0.99 or \
-                (c["shorts"] and (any(b["c"] < lo for b in later) or last <= lo * 1.01)):
+        if any(b["c"] > hi for b in later) or last >= hi * (1 - near_pct / 100.0) or \
+                (c["shorts"] and (any(b["c"] < lo for b in later) or last <= lo * (1 + near_pct / 100.0))):
             keep.append(sym)
     return keep
+
+
+# ---------------------------------------------------------------- v2 screen: watchlist, get ready, freshness, mood
+
+
+
+def watch_info(sym, series, daily, nifty, now, cfg=None, daily_chart=None, sector=None, live=None):
+    """A stock that has NOT broken out yet: its setup rating (0-10, before the breakout), the checks that
+    can be known in advance, and the trade plan if it triggers. None if it is not a watch candidate.
+
+    Rating points: with the daily trend 2, 20-day average rising 1, in play so far 2 (1.5x) / 1 (1.2x),
+    stronger than Nifty so far 1, sector moving the same way 1, range size okay 1, ATR room (under half
+    used) 1, NR7 or narrow CPR 1. Stocks failing an advance must-pass check are left out."""
+    c = dict(DEFAULTS)
+    c.update(cfg or {})
+    day = now.date()
+    cutoff = min(now, datetime.datetime.combine(day, datetime.time(15, 30)))
+    bars = day_bars(series, day, cutoff)
+    n_or = int(c["or_bars"])
+    if len(bars) < n_or or bars[0]["start"].time() != IST_OPEN:
+        return None
+    rng = bars[:n_or]
+    or_high, or_low = max(b["h"] for b in rng), min(b["l"] for b in rng)
+    if any(b["c"] > or_high for b in bars[n_or:]):
+        return None                                        # already broke out: it is a pick or a skip now
+    last = bars[-1]
+    price = float(live) if live else last["c"]
+    tick = tick_size(or_high)
+    entry = snap(or_high + tick, "up", or_high)
+    if price < entry * (1 - WATCH_PCT / 100.0):
+        return None
+    stop = snap((or_high + or_low) / 2.0, "down", entry)
+    risk = entry - stop
+    if risk <= 0:
+        return None
+    target = snap(entry + c["reward_r"] * risk, ref=entry)
+    qty = size("buy", entry, stop, c["capital"], c["max_loss"])
+    _, ybars = previous_day(series, day)
+    prev_close = ybars[-1]["c"] if ybars else None
+    avg20 = sma(daily or [])
+    rows = daily_ohlc(daily_chart, day) if daily_chart else []
+    a14 = atr(rows)
+    range_ratio = (or_high - or_low) / a14 if a14 else None
+    day_range = max(b["h"] for b in bars) - min(b["l"] for b in bars)
+    atr_used = day_range / a14 if a14 else None
+    rv = relative_volume(series, day, last["start"])
+    nb = [x for x in day_bars(nifty or {}, day, cutoff) if x["start"] <= last["start"]]
+    _, nyb = previous_day(nifty or {}, day)
+    n_chg = pct(nb[-1]["c"], nyb[-1]["c"]) if nb and nyb else None
+    s_chg = pct(last["c"], prev_close)
+    vw = vwap(bars)
+    trend = None if not (avg20 and prev_close) else prev_close > avg20
+    room = None if atr_used is None else atr_used < c["max_atr_used"]
+    range_ok = None if range_ratio is None else c["range_min"] <= range_ratio <= c["range_max"]
+    fits = qty >= 1 and c["min_price"] <= entry <= c["max_price"]
+    ch_share = None
+    if qty >= 1:
+        gross = qty * (target - entry)
+        ch_share = charges(qty, entry, target) / gross if gross > 0 else 1.0
+    worth = None if ch_share is None else ch_share <= c["max_charges_share"]
+    if trend is False or room is False or range_ok is False or not fits or worth is False:
+        return None
+    cp = cpr(max(x["h"] for x in ybars), min(x["l"] for x in ybars), ybars[-1]["c"]) if ybars else None
+    pts = 0
+    pts += 2 if trend else 0
+    pts += 1 if sma_rising(daily or []) else 0
+    pts += 2 if rv and rv >= 1.5 else 1 if rv and rv >= 1.2 else 0
+    pts += 1 if (s_chg is not None and n_chg is not None and s_chg > n_chg) else 0
+    pts += 1 if (sector and sector[1] is not None and sector[1] > 0) else 0
+    pts += 1 if range_ok else 0
+    pts += 1 if (atr_used is not None and atr_used < 0.5) else 0
+    pts += 1 if ((rows and is_nr7(rows)) or (cp and cp[3] < c["narrow_cpr_pct"])) else 0
+    loss = -net("buy", qty, entry, stop)
+    gain = net("buy", qty, entry, target)
+    return {"symbol": sym, "kind": "watch", "side": "buy", "rating": min(pts, 10), "price": round(price, 2),
+            "or_high": or_high, "or_low": or_low, "entry": entry, "stop": stop, "target": target,
+            "lock": snap(entry + risk, ref=entry), "risk": round(risk, 2), "qty": qty,
+            "loss": loss, "gain": gain, "to_go": round(max(entry - price, 0.0), 2),
+            "closeness": max(0.0, min(1.0, 1 - (entry - price) / (entry * WATCH_PCT / 100.0))),
+            "spark": [b["c"] for b in bars][-24:], "rvol": round(rv, 1) if rv else None, "sector": sector,
+            "checks": {"trend": trend, "room": room if room is not None else range_ok, "news": None,
+                       "charges": worth, "volume": None, "candle": None,
+                       "vwap": None if not vw else price > vw},
+            "closes_at": candle_close(now)}
+
+
+def bar_state(price, entry, risk):
+    """Get ready / freshness colour: green below the buy price; above it amber, orange, then red."""
+    if price is None or not risk:
+        return "green"
+    over = (price - entry) / risk
+    if over <= 0:
+        return "green"
+    if over < 0.2:          # reward:risk at this price still 1.5 : 1 or better (2x target)
+        return "amber"
+    if over < 0.4:          # 1.2 : 1 or better
+        return "orange"
+    return "red"
+
+
+def freshness(pick, live, now, cfg=None):
+    """('fresh'|'late'|'missed', details) for a BUY / SELL pick, from the live price and the signal's age.
+    Fresh: at most 0.2x the risk past the buy price (reward:risk at this price 1.5 : 1 or better with a 2x
+    target) and under 15 minutes old. Late: reward:risk at the live price still 1.2 : 1 or better and under
+    30 minutes old (shares and reward recalculated). Missed: beyond that, don't chase."""
+    long = pick["side"] == "buy"
+    price = float(live) if live else pick["price"]
+    risk = pick["risk"] or 0.01
+    moved = ((price - pick["entry"]) if long else (pick["entry"] - price)) / risk
+    age = (now - pick["signal_time"]).total_seconds() / 60.0
+    risk_now = abs(price - pick["stop"])
+    reward_now = abs(pick["target"] - price)
+    rr_now = reward_now / risk_now if risk_now > 0 else 0.0
+    c = dict(DEFAULTS)
+    c.update(cfg or {})
+    qty_now = size(pick["side"], price, pick["stop"], c["capital"], c["max_loss"])
+    d = {"qty_now": qty_now, "price": round(price, 2), "moved_r": round(moved, 2), "age_min": int(age), "rr_now": round(rr_now, 2),
+         "past_entry": round(max(0.0, (price - pick["entry"]) if long else (pick["entry"] - price)), 2),
+         "chase_limit": snap(pick["entry"] + (0.2 * risk if long else -0.2 * risk), ref=pick["entry"])}
+    if moved <= 0.2 and age <= 15:
+        return "fresh", d
+    if moved <= 0.4 and age <= 30 and rr_now >= 1.2:
+        return "late", d
+    return "missed", d
+
+
+def premarket_rating(closes):
+    """Before 9:30 (no opening range yet): a rating from daily closes only. Above the 20-day average 3,
+    average rising 2, within 2% of the 20-day high 3, RSI 14 between 50 and 70 2."""
+    if len(closes) < 25:
+        return None
+    pts = 0
+    avg = sum(closes[-20:]) / 20.0
+    pts += 3 if closes[-1] > avg else 0
+    pts += 2 if sma_rising(closes) else 0
+    pts += 3 if closes[-1] >= max(closes[-20:]) * 0.98 else 0
+    r = scan.rsi(closes)
+    pts += 2 if r is not None and 50 <= r <= 70 else 0
+    return pts
+
+
+def market_mood(vix, up, down, nifty_chg):
+    """('good'|'mixed'|'weak', score -3..3) from India VIX, breadth and Nifty's move today."""
+    score = 0
+    if up + down:
+        share = up / float(up + down)
+        score += 1 if share >= 0.6 else -1 if share <= 0.4 else 0
+    if nifty_chg is not None:
+        score += 1 if nifty_chg > 0.2 else -1 if nifty_chg < -0.2 else 0
+    if vix:
+        score += -1 if vix[0] > 18 else 1 if vix[0] < 15 else 0
+    return ("good" if score >= 1 else "weak" if score <= -1 else "mixed"), score

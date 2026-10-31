@@ -217,7 +217,7 @@ def readiness_card(ready):
     rows = "".join('<div class="v1row" style="font-size:13px;margin:3px 0"><span>%s %s</span><span class="v1mut">%s'
                    '</span></div>' % ('<span style="color:var(--g)">&#10003;</span>' if ok else
                                        '<span class="v1mut">&#9675;</span>', esc(name), esc(val))
-                   for name, ok, val in ready["goals"])
+                   for name, ok, val, _ in ready["goals"])
     done = ready["done"]
     msg = ("All 4 goals met: you can consider real money, starting small." if done == 4 else
            "%d of 4 goals met. Keep practising." % done)

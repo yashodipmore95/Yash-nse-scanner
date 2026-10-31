@@ -22,9 +22,11 @@ import engine
 import journal
 import lists
 import ui
+import ui2
 
 st.set_page_config(page_title="NSE scanner", page_icon="\U0001F4C8", layout="centered")
 st.markdown(ui.CSS, unsafe_allow_html=True)
+st.markdown(ui2.CSS, unsafe_allow_html=True)
 
 
 def html(s):
@@ -139,7 +141,7 @@ def save_journal(data, message):
 # ---------------------------------------------------------------- settings (side panel)
 
 with st.sidebar:
-    page_choice = st.radio("Page", ["Scanner", "Backtest (60 days)"], index=0, horizontal=True)
+    page_choice = st.radio("Page", ["Scanner", "My progress", "Backtest (60 days)"], index=0)
     st.header("Settings")
     mode_label = st.radio("Mode", ["Practice (paper)", "Real money"], index=0)
     mode = "paper" if mode_label.startswith("Practice") else "real"
@@ -260,9 +262,12 @@ def news(sym, hour):
 # ---------------------------------------------------------------- dialogs
 
 @st.dialog("I took this trade")
-def took_dialog(pick):
+def took_dialog(pick, early=False):
     long = pick["side"] == "buy"
     st.write("**%s** %s. Enter what actually happened in Groww." % (pick["symbol"], "buy" if long else "short sell"))
+    if early:
+        st.warning("Early entry: the candle has not closed yet, so volume, candle and VWAP are not confirmed. "
+                   "Saved with the tag \"Early entry\".")
     c1, c2 = st.columns(2)
     entry = c1.number_input("My %s price (\u20b9)" % ("buy" if long else "sell"), value=float(pick["entry"]),
                             step=0.05, format="%.2f")
@@ -294,7 +299,8 @@ def took_dialog(pick):
                    % (engine.rupees(max_loss), engine.rupees(capital), fit))
     if st.button("Start tracking", type="primary", use_container_width=True):
         try:
-            t = journal.new_trade(pick, pick["side"], entry, stop, int(qty), mode, engine.now_ist(), CFG)
+            t = journal.new_trade(pick, pick["side"], entry, stop, int(qty), mode, engine.now_ist(), CFG,
+                                  early=early)
         except journal.JournalError as e:
             st.error(str(e))
             return
@@ -344,9 +350,10 @@ def scan_market(now, day, key, key30, nifty, data):
     spark, _ = spark_5m(tuple(inrange), key) if inrange else ({}, {})
     out["up"], out["down"] = engine.breadth(daily, spark, day, now)
     cands = set(engine.stage_one(spark, now, CFG))
-    cands = [s_ for s_ in inrange if s_ in cands][:25]
+    cands = [s_ for s_ in inrange if s_ in cands][:30]
     industries = industry_map(day.isoformat())
     results = []
+    out["watch_items"] = []
     for s_ in cands:
         series = chart(s_, key)
         if not series:
@@ -355,6 +362,10 @@ def scan_market(now, day, key, key30, nifty, data):
         sec_name = industries.get(s_)
         sec = (sec_name, out["sectors"].get(sec_name)) if sec_name else None
         dchart = daily_chart(s_, day.isoformat())
+        w = engine.watch_info(s_, series, closes, nifty, now, CFG, daily_chart=dchart, sector=sec)
+        if w:
+            w["_series"], w["_closes"], w["_dchart"] = series, closes, dchart
+            out["watch_items"].append(w)
         r = engine.analyse(s_, series, closes, nifty, now, CFG, daily_chart=dchart, sector=sec)
         if r and r["kind"] == "pick":
             r = engine.analyse(s_, series, closes, nifty, now, CFG, news_flag=news(s_, now.hour),
@@ -400,10 +411,7 @@ def focus(t, now, key, key30, nifty, phase):
                      type="primary", use_container_width=True):
             save_journal(journal.replace(load_journal(), dict(t, stop=stt["new_stop"], stop_moved_at=now.replace(
                 microsecond=0).isoformat())), "Move stop %s" % t["symbol"])
-            try:
-                st.rerun(scope="fragment")
-            except TypeError:  # older Streamlit
-                st.rerun()
+            st.rerun()
     st.caption("How did it end?" if stt["alert"] in ("stop", "target", "exit") else "Closed it already?")
     tag = st.radio("How did this trade go, honestly?", journal.TAGS, index=0, horizontal=True, key="tag" + t["id"])
     followed = tag
@@ -473,6 +481,36 @@ def focus_panel():
         focus(t, now, key, key30, nifty, phase)
 
 
+def premarket_top(day):
+    """Before 9:30: the best 5 by the daily-closes rating."""
+    syms, _ = symbols_for(source, typed, day.isoformat())
+    if not syms:
+        return []
+    daily, _ = daily_data(tuple(syms), day.isoformat())
+    rated = []
+    for s_ in syms:
+        m = (daily.get(s_) or {}).get("meta") or {}
+        p = m.get("regularMarketPrice")
+        if not (p and min_price <= p <= max_price):
+            continue
+        r = engine.premarket_rating(engine.closes_before(daily.get(s_) or {}, day + datetime.timedelta(days=1)))
+        if r is not None:
+            rated.append((r, s_))
+    rated.sort(key=lambda t: (-t[0], t[1]))
+    return [(s_, r, "setup") for r, s_ in rated[:5]]
+
+
+def show_top5(items):
+    prev = st.session_state.get("top5_prev", [])
+    html(ui2.top5(items, prev))
+    st.session_state["top5_prev"] = [s_ for s_, _, _ in items[:5]]
+
+
+def bt_rate(score):
+    rates = st.session_state.get("bt_rates") or {}
+    return rates.get(score)
+
+
 def page():
     renew_login()
     now = engine.now_ist()
@@ -482,85 +520,172 @@ def page():
     phase, phase_msg = engine.market_phase(now)
     if phase != st.session_state.get("phase_at_start"):      # e.g. 9:15 or 3:30 passed: reset the schedule
         st.rerun()
-    phase_msg = schedule_message(now, phase, phase_msg)
-    header(now)
-    html('<span class="v1pill" style="background:var(--bg-b);color:var(--b)">%s</span>'
-         '<span class="v1pill" style="border:1px solid var(--line)">%s capital</span>'
-         '<span class="v1pill" style="border:1px solid var(--line)">Max loss %s</span>'
-         '<span class="v1pill" style="border:1px solid var(--line)">&#8377;%g&ndash;%g</span>'
-         % ("Practice mode" if mode == "paper" else "Real money", engine.rupees(capital),
-            engine.rupees(max_loss), min_price, max_price))
-    nifty = chart(engine.NIFTY, key) if phase in ("open", "forming", "after") else None
-    n_today = [b["c"] for b in engine.day_bars(nifty or {}, day, now)]
-    done, why, counts = journal.guard(data, mode, day, CFG)
-    html(ui.day_strip(counts, int(max_trades), n_today))
-    if phase_msg:
-        st.info(phase_msg)
-    todays = [e for e in EVENTS if e.get("date") == day.isoformat()]
-    for e in todays:
-        st.warning("Big event today: %s%s. No new trades within %d minutes of it."
-                   % (e.get("name", "event"), (" at " + e["time"]) if e.get("time") else " (no time set: be careful all day)",
-                      engine.DEFAULTS["event_window_min"]))
+    if journal.open_trades(data, mode):            # a trade was just opened: switch to focus mode
+        st.rerun()
+    status = [schedule_message(now, phase, phase_msg)] if phase_msg else []
+    for e in [e for e in EVENTS if e.get("date") == day.isoformat()]:
+        status.append("Big event today: %s%s" % (e.get("name", "event"), (" at " + e["time"]) if e.get("time") else ""))
 
-    res = {"picks": [], "watch": [], "skipped": [], "finished": [], "scanned": 0, "checked": 0, "note": "",
-           "up": 0, "down": 0, "sectors": {}}
-    if phase in ("open", "after"):
+    # 1 header
+    header(now)
+    nifty = chart(engine.NIFTY, key) if phase in ("open", "forming", "after") else None
+    done, why, counts = journal.guard(data, mode, day, CFG)
+
+    if phase in ("closed", "pre", "forming"):
+        # 2 top 5 (pre-market rating); the rest of the page waits for the opening range
+        show_top5(premarket_top(day))
+        html('<div class="v2mut">Pre-market top 5, rated on daily closes. The live watchlist starts at 9:30 AM.</div>')
+        res = None
+    else:
         with st.spinner("Updating..."):
             res = scan_market(now, day, key, key30, nifty, data)
             data = track_signals(load_journal(), res["allpicks"], now, key)
-        html(ui.vix_chip(vix(key)))
-        html(ui.sector_tiles(res["sectors"]))
-        html(ui.breadth_bar(res["up"], res["down"]))
-    picks, watch, skipped = res["picks"], res["watch"], res["skipped"]
-    scanned, checked, note = res["scanned"], res["checked"], res["note"]
+        live_syms = sorted({w["symbol"] for w in res.get("watch_items", [])} | {r["symbol"] for r in res["picks"]})
+        prices = live(tuple(live_syms), key30) if (live_syms and phase == "open") else {}
+        # split the watch items: live price past the buy price -> Get ready, else the watchlist
+        ready, watch = [], []
+        for w in res.get("watch_items", []):
+            lp = prices.get(w["symbol"])
+            if lp:
+                w = dict(w, price=round(lp, 2), to_go=round(max(w["entry"] - lp, 0.0), 2))
+            (ready if w["price"] >= w["entry"] else watch).append(w)
+        ready.sort(key=lambda w: (-w["rating"], w["price"] - w["entry"]))
+        pins = st.session_state.setdefault("pins", set())
+        watch.sort(key=lambda w: (w["symbol"] not in pins, -w["rating"], w["to_go"]))
+        # picks: freshness from the live price
+        fresh, late, missed = [], [], []
+        for r in res["picks"]:
+            stt, d = engine.freshness(r, prices.get(r["symbol"]), now, CFG)
+            (fresh if stt == "fresh" else late if stt == "late" else missed).append((r, d))
+        fresh.sort(key=lambda t: (t[1]["age_min"], -t[0]["score"]))      # freshest first
+        late.sort(key=lambda t: (t[1]["age_min"], -t[0]["score"]))
+        for r, d in missed:
+            res["skipped"].append(dict(r, reason="Missed: price ran %s past the entry" % engine.rupees(d["past_entry"])
+                                       if d["past_entry"] >= 1 else "Missed: signal %d min old" % d["age_min"]))
+        # 2 top 5
+        items = [(r["symbol"], r["score"], "pick") for r, _ in fresh + late] + \
+                [(w["symbol"], w["rating"], "setup") for w in ready + watch]
+        seen, top = set(), []
+        for it in sorted(items, key=lambda t: -t[1]):
+            if it[0] not in seen:
+                seen.add(it[0])
+                top.append(it)
+        show_top5(top)
+        # 3 market mood
+        n_today = engine.day_bars(nifty or {}, day, now)
+        _, nyb = engine.previous_day(nifty or {}, day)
+        n_chg = engine.pct(n_today[-1]["c"], nyb[-1]["c"]) if (n_today and nyb) else None
+        v = vix(key)
+        label, score = engine.market_mood(v, res["up"], res["down"], n_chg)
+        html(ui2.mood(label, score, v, res["up"], res["down"], n_chg, res["sectors"]))
 
-    if journal.open_trades(data, mode):            # a trade was just opened: switch to focus mode
-        st.rerun()
-    elif phase in ("closed", "pre", "forming"):
-        pass
-    elif done:
-        html(ui.done_card(why, counts))
-    elif note and not scanned:
-        st.error("Could not get the stock list (%s). See README: upload the list file into trader/lists/ in the "
-                 "GitHub repository, or choose another list." % note)
-    else:
-        if phase == "open" and watch:
-            prices = live(tuple(sorted(w["symbol"] for w in watch)), key30)
-            ready = [h for h in (engine.heads_up(w, prices.get(w["symbol"]), now, CFG) for w in watch) if h]
+        if done:
+            html(ui.done_card(why, counts))
+        elif phase == "open":
+            # 4 get ready
             if ready:
-                html('<div class="v1sec">Breaking out right now</div>')
-                for h in ready:
-                    html(ui.heads_up_card(h))
-        html('<div class="v1sec">Today\'s top picks</div>')
-        if not picks:
-            st.write("No stock passes every rule right now. No signal means no trade.")
-        for k, r in enumerate(picks):
-            if k == 0:
-                html(ui.pick_card(r))
-            else:
-                html(ui.pick_row(r))
-                with st.expander("Details: %s" % r["symbol"]):
-                    html(ui.pick_card(r))
-            if phase == "open":
+                html('<div class="v2sec">&#9889; Get ready</div>')
+                for k, h in enumerate(ready[:3]):
+                    html(ui2.getready(h, k == 0, now))
+                    if k == 0:
+                        early_pick = dict(h, entry=engine.snap(h["price"]), qty=engine.size(
+                            "buy", engine.snap(h["price"]), h["stop"], capital, max_loss))
+                        if st.button("I took this trade (early): %s" % h["symbol"], key="early" + h["symbol"],
+                                     use_container_width=True):
+                            took_dialog(early_pick, early=True)
+            # 5 picks
+            html('<div class="v2sec">&#128994; Picks</div>')
+            if not fresh and not late:
+                html('<div class="v2mut">No stock passes every rule right now. No signal means no trade.</div>')
+            for r, d in fresh:
+                html(ui2.pick_card(r, "fresh", d, capital, bt_rate(r["score"])))
                 st.code(ui.order_text(r["symbol"], r["side"], r["qty"], r["entry"], r["stop"], r["target"]),
                         language=None)
                 if st.button("I took this trade: %s" % r["symbol"], key="took" + r["symbol"], type="primary",
                              use_container_width=True):
                     took_dialog(r)
-        if watch:
-            html('<div class="v1sec">Getting close</div>')
-            html(ui.watch_rows(watch))
+            for r, d in late:
+                html(ui2.late_row(r, d))
+                if st.button("I took this trade (late): %s" % r["symbol"], key="late" + r["symbol"],
+                             use_container_width=True):
+                    took_dialog(dict(r, entry=d["price"], qty=d["qty_now"]))
+            # 6 watchlist
+            if watch:
+                html('<div class="v2sec">&#128065; Watchlist</div>')
+                open_sym = st.session_state.get("open_watch")
+                for w in watch[:8]:
+                    is_open = w["symbol"] == open_sym
+                    html(ui2.watch_row(w, is_open))
+                    if st.button(("\u25b4 Hide %s" if is_open else "\u25be Details: %s") % w["symbol"],
+                                 key="w" + w["symbol"], use_container_width=True):
+                        st.session_state["open_watch"] = None if is_open else w["symbol"]
+                        st.rerun()
+                    if is_open:
+                        html(ui2.watch_detail(w, now))
+                        st.code("%s | BUY | Qty %d | Intraday | SL order | Trigger %.2f | Limit %.2f"
+                                % (w["symbol"], w["qty"], w["entry"],
+                                   engine.snap(w["entry"] * 1.001, "up", w["entry"])), language=None)
+                        pinned = w["symbol"] in pins
+                        if st.button("Unpin" if pinned else "\U0001F4CC Pin to top", key="pin" + w["symbol"]):
+                            (pins.discard if pinned else pins.add)(w["symbol"])
+                            st.rerun()
+                if len(watch) > 8:
+                    html('<div class="v2mut">+ %d more within 2%% of their buy price</div>' % (len(watch) - 8))
+        # 7 folded lists
         if res["finished"]:
-            with st.expander("Already finished today: %d breakouts" % len(res["finished"])):
+            wins = sum(1 for r in res["finished"] if r["outcome"] == "target")
+            with st.expander("Finished today  \U0001F7E2 %d  \U0001F534 %d" % (wins, len(res["finished"]) - wins)):
                 html(ui.finished_rows(res["finished"]))
-        with st.expander("Skipped right now: %d stocks" % len(skipped)):
-            html(ui.skipped_rows(skipped) or '<span class="v1mut">None yet.</span>')
-        st.caption("Scanned %d stocks priced \u20b9%g\u2013%g from %s; %d had a full check."
-                   % (scanned, min_price, max_price, source, checked))
+        with st.expander("Skipped right now: %d" % len(res["skipped"])):
+            html(ui.skipped_rows(res["skipped"]) or '<span class="v1mut">None yet.</span>')
 
-    results_section(data)
+    # 8 bottom
+    html(ui2.LEGEND)
+    for msg in status:
+        st.info(msg)
+    if res:
+        st.caption("Scanned %d stocks priced \u20b9%g\u2013%g from %s; %d had a full check."
+                   % (res["scanned"], min_price, max_price, source, res["checked"]))
     html('<div class="v1mut" style="text-align:center;margin-top:12px">A pick matches rules, it is not a promise. '
          'Free Yahoo data can lag. Not financial advice.</div>')
+
+
+def progress_page():
+    data = load_journal()
+    now = engine.now_ist()
+    html('<b style="font-size:20px">&#128202; My progress (%s)</b>' % ("practice" if mode == "paper" else "real money"))
+    res = journal.results(data, mode)
+    pg = journal.progress(data, mode, now.date())
+    html(ui2.readiness_rings(res["ready"]))
+    if not res["count"]:
+        st.info("No closed %s trades yet. Charts appear after your first closed trade." %
+                ("practice" if mode == "paper" else "real"))
+    else:
+        html(ui2.equity(res["running"], res["total"]))
+        html(ui2.calendar(pg["days"], now.date()))
+        html(ui2.histogram(pg["r_buckets"]))
+        html('<div class="v2grid2">%s%s</div>' % (ui2.bars("Win % by signal score", pg["by_score"]),
+                                                  ui2.bars("Win % by entry time", pg["by_hour"])))
+        hows = pg["hows"]
+        html(ui2.stacked("How trades ended", [("target", hows.get("target", 0), ui2.GREEN),
+                                              ("stop", hows.get("stop", 0), ui2.RED),
+                                              ("other", hows.get("other", 0), ui2.AMBER)]))
+        tags = pg["tags"]
+        cols = [ui2.GREEN, ui2.AMBER, ui2.ORANGE, ui2.RED, "#7F77DD", "#888780", ui2.BLUE]
+        tag_parts = [(k, v, cols[i % len(cols)]) for i, (k, v) in enumerate(sorted(tags.items(), key=lambda kv: -kv[1]))]
+        html('<div class="v2grid2">%s%s</div>' % (
+            ui2.donut("Mistakes", tag_parts, '<span style="color:var(--r)">cost %s</span>'
+                      % engine.rupees(pg["mistake_cost"], True)),
+            ui2.donut("Charges vs profit", [("kept", max(pg["net"], 0), "#97C459"),
+                                            ("charges", max(pg["charges"], 0), "#888780")],
+                      "charges %s" % engine.rupees(pg["charges"]))))
+        html(ui2.slippage_dots(pg["slippage"], pg["slippage_avg"]))
+        html('<div class="v2grid2">%s%s</div>' % (ui2.bars("Early vs confirmed entries", pg["entries"]),
+                                                  ui2.bars("Signals you took vs skipped", pg["took_vs_skip"])))
+    html('<div class="v2sec">All signals, filter lab and exit test</div>')
+    html(ui.signals_card(journal.signal_stats(data)))
+    html(ui.lab_card(journal.lab_stats(data), journal.exit_test(data)))
+    html(ui.results_card(res, mode))
 
 
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
@@ -619,6 +744,11 @@ def backtest_page():
         st.error("Yahoo did not send the Nifty data. Try again in a few minutes.")
         return
     tr = res["trades"]
+    by_score = {}
+    for t in tr["phase1"]:
+        if t.get("net") is not None:
+            by_score.setdefault(t["score"], []).append(t["net"] > 0)
+    st.session_state["bt_rates"] = {k: round(100.0 * sum(v) / len(v)) for k, v in by_score.items() if len(v) >= 5}
     yw = backtest.summary(backtest.your_way(tr["phase1"], CFG))
     html(ui.bt_headline(yw, res["days"], res["stocks"]))
     st.markdown("**Variants compared** (all signals; *your way* applies 2 trades a day, one at a time)")
@@ -659,6 +789,9 @@ st.session_state["phase_at_start"] = engine.market_phase(_now)[0]
 if page_choice.startswith("Backtest"):
     backtest_page()
     st.stop()
+if page_choice.startswith("My progress"):
+    progress_page()
+    st.stop()
 RUN_EVERY = engine.refresh_seconds(_now) if auto else None     # Option A: 60 s before 9:15, 30 s open, else off
 run_every = RUN_EVERY
 fragment = (lambda f: st.fragment(run_every=run_every)(f)) if (hasattr(st, "fragment") and run_every) else (lambda f: f)
@@ -670,7 +803,6 @@ if journal.open_trades(_data, mode):
     _done, _why, _counts = journal.guard(_data, mode, _now.date(), CFG)
     html(ui.day_strip(_counts, int(max_trades), []))
     fragment(focus_panel)()
-    results_section(_data)
 else:
     fragment(page)()
 

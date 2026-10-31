@@ -4,6 +4,9 @@
 Variants, each compared with the Phase 1 rules (15-minute range, stop at the range middle, entry at
 the breakout close, 2x target with safety lock, trailing stop, time exit and market-drop exit):
 
+  touch        buy the moment the price touches the breakout price (an advance stop-limit order), with only
+               the checks known in advance (trend, ATR room, range size, money, charges); no volume, candle
+               or VWAP confirmation
   old_rules    the rules before Phase 1 (no must-pass volume, candle, ATR room, trend, charges checks)
   retest       wait for a pullback to the range high that holds, with a firm candle, then enter
   range30      a 30-minute opening range instead of 15
@@ -27,9 +30,10 @@ import datetime
 import engine
 
 BAR = engine.BAR
-VARIANTS = ["phase1", "old_rules", "retest", "range30", "stop_candle", "half_3r", "vwap_exit", "vwap_trail"]
+VARIANTS = ["phase1", "touch", "old_rules", "retest", "range30", "stop_candle", "half_3r", "vwap_exit", "vwap_trail"]
 VARIANT_NAMES = {
     "phase1": "Phase 1 rules (now)",
+    "touch": "Buy on touch (order in advance)",
     "old_rules": "Old rules (before Phase 1)",
     "retest": "Entry: wait for the retest",
     "range30": "30-minute opening range",
@@ -339,6 +343,9 @@ def run(charts, dailies, nifty, cfg, days=None, progress=None):
                     ((mh[-1] > mh[-2] and mh[-1] > 0) if long else (mh[-1] < mh[-2] and mh[-1] < 0))
                 f["adx20"] = None if ad is None else ad > 20
                 trades["phase1"][-1]["filters"] = f
+            t = touch_trade(sym, win, closes, nwin, bars, d, c, dchart, nmap)
+            if t:
+                trades["touch"].append(t)
     if progress:
         progress(1.0)
     return {"trades": trades, "days": len(all_days), "stocks": len(charts), "rejected": rejected}
@@ -358,6 +365,39 @@ def reason_group(reason):
         if key.lower() in reason.lower():
             return label
     return "Other"
+
+
+def touch_trade(sym, win, closes, nwin, bars, d, c, dchart, nmap):
+    """Option B: an order placed in advance at the breakout price fills on the first touch."""
+    n_or = int(c["or_bars"])
+    if len(bars) <= n_or:
+        return None
+    or_high = max(b["h"] for b in bars[:n_or])
+    for j in range(n_or, len(bars)):
+        b = bars[j]
+        t = b["start"].time()
+        if t > c["no_entries_after"]:
+            return None
+        if b["h"] <= or_high:
+            continue
+        if t < c["no_entries_before"]:
+            return None                     # touched inside the no-entry window: no order would be live
+        w = engine.watch_info(sym, win, closes, nwin, b["start"], c, daily_chart=dchart)
+        if not w:
+            return None                     # an advance check failed: you would not have placed the order
+        entry = max(b["o"], w["entry"])
+        qty = engine.size("buy", entry, w["stop"], c["capital"], c["max_loss"])
+        if qty < 1:
+            return None
+        r = {"signal_time": b["start"], "side": "buy", "score": w["rating"]}
+        if b["l"] <= w["stop"]:             # fell back to the stop within the same candle
+            legs, out_t = [(1.0, w["stop"], "stop")], b["start"] + BAR
+        else:
+            legs, out_t = manage(bars, j, "buy", entry, w["stop"], "current", nmap, c)
+        tr = _trade(sym, d, r, entry, qty, legs, out_t)
+        tr["time"] = b["start"].strftime("%H:%M")
+        return tr
+    return None
 
 
 def _blank(sym, d, r):
