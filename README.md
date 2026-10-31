@@ -32,6 +32,14 @@ requirements.txt          streamlit>=1.37
   After 1 PM only 8+ counts.
 - Range size: the 9:15–9:30 range must be 0.25× to 1.2× the stock's normal daily move (14-day
   ATR); a range outside that is skipped.
+- Phase 1 must-pass rules (any one failing means SKIP, whatever the score):
+  - Volume: the breakout candle at least 1.5x the same 5-minute slot's volume on recent days.
+  - Firm candle: body at least half the candle, close in its top third (bottom third for shorts).
+  - Room left: today's range has used under 70% of the 14-day ATR (falls back to "up more than 3%"
+    when the ATR is unknown).
+  - With the daily trend: a BUY only above the 20-day average, a SELL only below it.
+  - Worth the charges: Groww charges under 25% of the gain at the target.
+  - Big events: no new signals within 30 minutes of an event in `trader/events.json`.
 - VWAP must pass: a BUY's breakout candle must close above the day's average price (VWAP), a SELL's
   below it. Otherwise the stock is skipped, whatever its score.
 - Always skipped: results or big news in the headlines, a big opening gap, already up more than
@@ -56,6 +64,36 @@ requirements.txt          streamlit>=1.37
 - Exit now: Nifty falls sharply, no real move within an hour, or 2:55 PM.
 - When it ends, tap Hit target, Hit stop-loss or Sold at another price. The "I followed my rules"
   switch (on by default) feeds your discipline score.
+
+## Big-event calendar
+
+Edit `trader/events.json` in the repository (GitHub: open the file, pencil icon, commit). Example:
+
+```json
+[
+  {"date": "2026-12-04", "time": "10:00", "name": "RBI policy"},
+  {"date": "2027-02-01", "name": "Union Budget"}
+]
+```
+
+An event with a time blocks new signals 30 minutes before and after it; one without a time shows a
+warning all day. Check the dates on the RBI and Government websites: the app does not invent them.
+
+## Risk per trade
+
+Practice mode starts at ₹75 per trade, Real money at ₹50 (1% of ₹5,000). Move up only after your
+results stay positive after charges.
+
+## 60-day backtest (side panel: Page → Backtest)
+
+Replays the scanner's exact rules on the last 60 days of 5-minute data (Yahoo's limit) for your
+most-traded stocks in range, with Groww charges, managing every trade the way the app does. It shows:
+the Phase 1 result "your way" (2 trades a day, one at a time) with a running-total line; a table of
+variants (old rules, retest entry, 30-minute range, stop below the breakout candle, half at 1.5x with a
+3x trail, VWAP exit, VWAP trail); why breakouts were skipped; and filters with and without (RSI above
+60, MACD expanding, daily ADX above 20, and the filter-lab fields). The first run downloads about two
+charts per stock and takes a few minutes; results are kept for 12 hours. Limits: no slippage beyond
+candle prices, today's stock list, no news check for past days. A handful of trades proves little.
 
 ## Opening the page late
 

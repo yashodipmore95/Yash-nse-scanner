@@ -530,3 +530,50 @@ def signals_card(ss):
             % ("g" if ss["total"] >= 0 else "r", engine.rupees(ss["total"], True), ss["count"], ss["win_rate"] or 0,
                engine.rupees(ss["avg"] or 0, True), part("Score 8+", ss["strong"]), part("Score 6-7", ss["normal"]),
                (" &middot; %d still running" % ss["pending"]) if ss["pending"] else ""))
+
+
+def curve_svg(curve, h=80):
+    if not curve:
+        return ""
+    run = [0.0] + list(curve)
+    lo, hi = min(run), max(run)
+    rng = (hi - lo) or 1
+    pts = " ".join("%.1f,%.1f" % (6 + k * 328.0 / max(len(run) - 1, 1), 6 + (hi - v) / rng * (h - 12))
+                   for k, v in enumerate(run))
+    zero = 6 + (hi - 0) / rng * (h - 12)
+    col = "#2e9e4f" if run[-1] >= 0 else "#d64545"
+    return ('<svg viewBox="0 0 340 %d" width="100%%"><line x1="6" y1="%.1f" x2="334" y2="%.1f" '
+            'stroke="rgba(127,127,127,.35)"/><polyline fill="none" stroke="%s" stroke-width="2.5" points="%s"/></svg>'
+            % (h, zero, zero, col, pts))
+
+
+def bt_headline(sm, days, stocks):
+    if not sm.get("trades"):
+        return ('<div class="v1card"><b>No trades</b><div class="v1mut">No breakout passed every Phase 1 rule in '
+                '%d days across %d stocks. See "Why breakouts were skipped" below.</div></div>' % (days, stocks))
+    col = "g" if sm["total"] >= 0 else "r"
+    return "".join([
+        '<div class="v1card v1%s"><div class="v1row"><b>Phase 1 rules, your way</b>'
+        '<b style="font-size:18px;color:var(--%s)">%s</b></div>' % (col, col, engine.rupees(sm["total"], True)),
+        '<div class="v1mut">%d trading days &middot; %d stocks &middot; max 2 trades a day, one at a time, '
+        'Groww charges included</div>' % (days, stocks),
+        curve_svg(sm.get("curve")),
+        '<div class="v1grid"><div>Trades <b>%d</b></div><div>Win rate <b>%d%%</b></div>'
+        '<div>Avg win <b style="color:var(--g)">%s</b></div><div>Avg loss <b style="color:var(--r)">%s</b></div>'
+        '<div>Profit factor <b>%s</b></div><div>Worst dip <b style="color:var(--r)">%s</b></div></div></div>'
+        % (sm["trades"], sm["win_rate"], engine.rupees(sm["avg_win"], True), engine.rupees(sm["avg_loss"], True),
+           sm["profit_factor"] if sm["profit_factor"] is not None else "-", engine.rupees(sm["max_drawdown"], True))])
+
+
+def rejected_bars(rejected):
+    if not rejected:
+        return ""
+    top = max(rejected.values())
+    rows = []
+    for label, n in sorted(rejected.items(), key=lambda kv: -kv[1]):
+        rows.append('<div style="display:flex;align-items:center;gap:8px;font-size:12px;margin:3px 0">'
+                    '<span style="width:170px">%s</span><div style="flex:1;height:8px;border-radius:4px;'
+                    'background:rgba(127,127,127,.2)"><div style="width:%d%%;height:100%%;border-radius:4px;'
+                    'background:var(--a)"></div></div><span class="v1mut" style="width:40px;text-align:right">%d</span>'
+                    '</div>' % (esc(label), max(3, int(100 * n / top)), n))
+    return '<div class="v1card">%s</div>' % "".join(rows)

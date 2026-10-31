@@ -86,6 +86,10 @@ WEAK_REASON = {
 WEAK_REASON_SHORT = dict(WEAK_REASON, volume="weak selling", vwap="above the day's average price",
                          relative="stronger than the market", room="support just below", market="market rising")
 DEFAULTS.update({"narrow_cpr_pct": 0.25, "near_52w_pct": 5.0})
+# Phase 1 must-pass rules (strict=False turns them off, for the backtest's "old rules" comparison)
+DEFAULTS.update({"strict": True, "min_volume_x": 1.5, "min_body": 0.5, "min_close_pos": 2.0 / 3.0,
+                 "max_atr_used": 0.7, "max_charges_share": 0.25, "event_window_min": 30, "events": [],
+                 "or_bars": 3, "stop_rule": "mid"})
 DEFAULTS.update({"range_min": 0.25, "range_max": 1.2, "early_until": datetime.time(11, 0),
                  "strong_only_after": datetime.time(13, 0)})
 
@@ -214,10 +218,11 @@ def day_bars(series, day, cutoff=None):
     out = []
     t, c = series.get("t") or [], series.get("c") or []
     o, h, l, v = (series.get(k) or [None] * len(t) for k in ("o", "h", "l", "v"))
+    ist = series.get("_ist")
     for i, ts in enumerate(t):
         if ts is None or i >= len(c) or c[i] is None:
             continue
-        st = scan.ts_to_ist(ts)
+        st = ist[i] if ist else scan.ts_to_ist(ts)
         if st.date() != day or st.second or st.minute % 5:
             continue
         if st.time() < IST_OPEN or st.time() >= datetime.time(15, 30):
@@ -231,9 +236,18 @@ def day_bars(series, day, cutoff=None):
     return out
 
 
+def series_days(series):
+    if series.get("_days"):
+        return series["_days"]
+    ist = series.get("_ist")
+    if ist:
+        return sorted({x.date() for x in ist if x})
+    return sorted({scan.ts_to_ist(ts).date() for ts in (series.get("t") or []) if ts})
+
+
 def previous_day(series, day):
     """(date, bars) of the last session before `day` in the series, or (None, [])."""
-    days = sorted({scan.ts_to_ist(ts).date() for ts in (series.get("t") or []) if ts})
+    days = series_days(series)
     prev = [d for d in days if d < day]
     if not prev:
         return None, []
@@ -287,6 +301,40 @@ def atr(rows, n=14):
     return sum(trs) / n
 
 
+def slot_volume_ratio(series, day, start, vol, max_days=4):
+    """The breakout candle's volume against the same 5-minute slot on up to `max_days` earlier days
+    (time-of-day normal: morning candles are always busier). None without history."""
+    if not vol:
+        return None
+    t = start.time()
+    days = series_days(series)
+    past = []
+    for d in [x for x in days if x < day][-max_days:]:
+        v = [b["v"] for b in day_bars(series, d) if b["start"].time() == t and b["v"]]
+        if v:
+            past.append(v[0])
+    if not past:
+        return None
+    avg = sum(past) / len(past)
+    return vol / avg if avg else None
+
+
+def event_near(events, when, window_min=30):
+    """The first event (from the editable calendar) within `window_min` minutes of `when`, or None.
+    Events: {"date": "YYYY-MM-DD", "time": "HH:MM", "name": "..."}; one without a time never blocks."""
+    for e in events or []:
+        try:
+            if e.get("date") != when.date().isoformat() or not e.get("time"):
+                continue
+            hh, mm = map(int, e["time"].split(":"))
+            t = datetime.datetime.combine(when.date(), datetime.time(hh, mm))
+        except (ValueError, AttributeError):
+            continue
+        if abs((when - t).total_seconds()) <= window_min * 60:
+            return e
+    return None
+
+
 def is_nr7(rows):
     """True when the last full session's range (high - low) was the smallest of the last 7 (None if too short)."""
     if len(rows) < 7:
@@ -314,7 +362,7 @@ def sma_rising(closes, n=20, back=5):
 def relative_volume(series, day, upto):
     """Today's volume up to and including the bar starting at `upto`, against the average of earlier
     days in the series up to the same time of day. None without earlier days."""
-    days = sorted({scan.ts_to_ist(ts).date() for ts in (series.get("t") or []) if ts})
+    days = series_days(series)
     t_end = upto.time()
 
     def cum(d):
@@ -347,10 +395,12 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
     day = now.date()
     cutoff = min(now, datetime.datetime.combine(day, datetime.time(15, 30)))
     bars = day_bars(series, day, cutoff)
-    if len(bars) < OR_BARS or bars[0]["start"].time() != IST_OPEN:
+    n_or = int(c["or_bars"])
+    if len(bars) < n_or or bars[0]["start"].time() != IST_OPEN:
         return None
-    rng = bars[:OR_BARS]
-    if [b["start"].time() for b in rng] != [datetime.time(9, 15), datetime.time(9, 20), datetime.time(9, 25)]:
+    rng = bars[:n_or]
+    first = datetime.datetime.combine(day, IST_OPEN)
+    if [b["start"] for b in rng] != [first + BAR * k for k in range(n_or)]:
         return None
     or_high, or_low = max(b["h"] for b in rng), min(b["l"] for b in rng)
     prev_day, ybars = previous_day(series, day)
@@ -363,7 +413,7 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
     last = bars[-1]
 
     trig = None
-    for i in range(OR_BARS, len(bars)):
+    for i in range(n_or, len(bars)):
         b = bars[i]
         if b["c"] > or_high:
             trig = ("buy", i)
@@ -389,7 +439,11 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
     when = b["start"] + BAR
     entry = snap(b["c"])
     mid = (or_high + or_low) / 2.0
-    stop = snap(mid, "down" if long else "up", entry)
+    if c["stop_rule"] == "candle":                  # backtest variant: just beyond the breakout candle
+        stop = snap(b["l"] if long else b["h"], "down" if long else "up", entry)
+        stop = stop - tick_size(entry) if long else stop + tick_size(entry)
+    else:
+        stop = snap(mid, "down" if long else "up", entry)
     risk = abs(entry - stop)
     target = snap(entry + c["reward_r"] * risk if long else entry - c["reward_r"] * risk, ref=entry)
     lock = snap(entry + risk if long else entry - risk, ref=entry)
@@ -402,9 +456,11 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
     span = b["h"] - b["l"]
     strength = ((b["c"] - b["l"]) / span if long else (b["h"] - b["c"]) / span) if span > 0 else 1.0
     pts["breakout"] = 2 if strength >= 0.6 else 1
-    earlier = [x["v"] for x in bars[1:i] if x["v"]]
-    avg = sum(earlier) / len(earlier) if earlier else None
-    vr = (b["v"] / avg) if (avg and b["v"]) else None
+    vr = slot_volume_ratio(series, day, b["start"], b["v"])
+    if vr is None:
+        earlier = [x["v"] for x in bars[1:i] if x["v"]]
+        avg = sum(earlier) / len(earlier) if earlier else None
+        vr = (b["v"] / avg) if (avg and b["v"]) else None
     pts["volume"] = 2 if vr and vr >= 1.5 else 1 if vr and vr >= 1.0 else 0
     vw = vwap(bars[:i + 1])
     pts["vwap"] = 1 if vw and ((b["c"] > vw) if long else (b["c"] < vw)) else 0
@@ -448,6 +504,7 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
     # hard checks, in the order a trader reads them
     gap = pct(bars[0]["o"], prev_close)
     moved = pct(entry, prev_close)
+    strict = c["strict"]
     checks = []
     reason = None
     if news_flag:
@@ -455,19 +512,47 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
     checks.append(("news", "No big news" if news_flag == "" else ("News check" if news_flag is None else "News today"),
                    None if news_flag is None else (news_flag == "")))
     late = when.time() > c["no_entries_after"] or when.time() < c["no_entries_before"]
-    too_far = (gap is not None and abs(gap) > c["max_gap_pct"]) or \
-              (moved is not None and ((moved > c["max_extended_pct"]) if long else (moved < -c["max_extended_pct"])))
-    checks.append(("late", "Not too late", not (late or too_far)))
+    big_gap = gap is not None and abs(gap) > c["max_gap_pct"]
+    day_range = max(x["h"] for x in bars[:i + 1]) - min(x["l"] for x in bars[:i + 1])
+    atr_used = day_range / a14 if a14 else None
+    if strict and atr_used is not None:
+        too_far = atr_used >= c["max_atr_used"]
+        far_msg = "Already used %d%% of its normal daily move (ATR)" % round(atr_used * 100)
+    else:
+        too_far = moved is not None and ((moved > c["max_extended_pct"]) if long else (moved < -c["max_extended_pct"]))
+        far_msg = "Already moved more than %g%% today" % c["max_extended_pct"]
+    checks.append(("late", "Room left today" if strict and atr_used is not None else "Not too late",
+                   not (late or big_gap or too_far)))
     if late:
         reason = reason or "Breakout came outside 9:30 AM to 2:30 PM"
+    elif big_gap:
+        reason = reason or "Opened with a big gap"
     elif too_far:
-        reason = reason or ("Opened with a big gap" if gap is not None and abs(gap) > c["max_gap_pct"]
-                            else "Already moved more than %g%% today" % c["max_extended_pct"])
+        reason = reason or far_msg
+    ev = event_near(c["events"], when, c["event_window_min"]) if strict else None
+    if ev:
+        reason = reason or "Big event: %s at %s" % (ev["name"], ev["time"])
     vw_ok = None if not vw else ((b["c"] > vw) if long else (b["c"] < vw))
     checks.append(("vwap", "Above VWAP" if long else "Below VWAP", vw_ok))
     if vw_ok is False:
         reason = reason or ("Closed below the day's average price (VWAP %.2f)" % vw if long
                             else "Closed above the day's average price (VWAP %.2f)" % vw)
+    if strict:
+        trend_ok = None if not (avg20 and prev_close) else ((prev_close > avg20) if long else (prev_close < avg20))
+        checks.append(("trend", "With daily trend", trend_ok))
+        if trend_ok is False:
+            reason = reason or ("Against its daily trend (below the 20-day average)" if long
+                                else "Against its daily trend (above the 20-day average)")
+        vol_ok = None if vr is None else vr >= c["min_volume_x"]
+        checks.append(("volume", "Volume %.1f\u00d7" % vr if vr else "Volume", vol_ok))
+        if vol_ok is False:
+            reason = reason or "Weak volume: %.1f\u00d7 normal (needs %.1f\u00d7)" % (vr, c["min_volume_x"])
+        body = abs(b["c"] - b["o"])
+        candle_ok = span <= 0 or (body >= c["min_body"] * span and strength >= c["min_close_pos"])
+        checks.append(("candle", "Firm candle", candle_ok))
+        if not candle_ok:
+            reason = reason or ("Weak candle: long wick or small body" if strength < c["min_close_pos"]
+                                else "Weak candle: small body")
     if range_ratio is not None:
         okr = c["range_min"] <= range_ratio <= c["range_max"]
         checks.append(("range", "Range size okay", okr))
@@ -480,6 +565,13 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
     if not fits:
         reason = reason or ("Price outside \u20b9%g to \u20b9%g" % (c["min_price"], c["max_price"])
                             if not (c["min_price"] <= entry <= c["max_price"]) else "Too risky for your capital")
+    if strict and qty >= 1:
+        gross = qty * abs(target - entry)
+        ch = charges(qty, entry, target) if long else charges(qty, target, entry)
+        share = ch / gross if gross > 0 else 1.0
+        checks.append(("charges", "Worth the charges", share <= c["max_charges_share"]))
+        if share > c["max_charges_share"]:
+            reason = reason or "Charges would take %d%% of the gain at the target" % round(share * 100)
     if risk < entry * 0.0005:
         reason = reason or "Stop too close to the entry"
     if reason is None and when.time() > c["strong_only_after"] and score < 8:
@@ -516,6 +608,7 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
                volume_ratio=round(vr, 1) if vr else None, vwap=round(vw, 2) if vw else None,
                strength="Strong" if score >= 8 else "Normal", raw_score=raw, rvol=round(rv, 1) if rv else None,
                range_ratio=round(range_ratio, 2) if range_ratio is not None else None, edge=edge_pct,
+               atr_used=round(atr_used, 2) if atr_used is not None else None,
                lab={"before_11": when.time() <= c["early_until"], "in_play": bool(rv and rv >= 2.0),
                     "trend_rising": sma_rising(daily or []) if long else (
                         None if sma_rising(daily or []) is None else not sma_rising(daily or [])),

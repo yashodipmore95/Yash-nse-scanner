@@ -17,6 +17,7 @@ import time
 
 import streamlit as st
 
+import backtest
 import engine
 import journal
 import lists
@@ -138,11 +139,15 @@ def save_journal(data, message):
 # ---------------------------------------------------------------- settings (side panel)
 
 with st.sidebar:
+    page_choice = st.radio("Page", ["Scanner", "Backtest (60 days)"], index=0, horizontal=True)
     st.header("Settings")
     mode_label = st.radio("Mode", ["Practice (paper)", "Real money"], index=0)
     mode = "paper" if mode_label.startswith("Practice") else "real"
     capital = st.number_input("Capital (\u20b9)", min_value=500.0, value=5000.0, step=500.0)
-    max_loss = st.number_input("Max loss per trade (\u20b9)", min_value=10.0, value=75.0, step=5.0)
+    max_loss = st.number_input("Max loss per trade (\u20b9)", min_value=10.0,
+                               value=75.0 if mode == "paper" else 50.0, step=5.0, key="max_loss_" + mode,
+                               help="Practice: \u20b975. Real money: start at \u20b950 (1% of \u20b95,000), "
+                                    "move to \u20b975 once your results stay positive after charges.")
     max_trades = st.number_input("Max trades per day", min_value=1, max_value=5, value=2, step=1)
     daily_loss = st.number_input("Stop for the day after losing (\u20b9)", min_value=10.0, value=150.0, step=10.0)
     c1, c2 = st.columns(2)
@@ -160,8 +165,20 @@ with st.sidebar:
     st.caption("Groww intraday charges are included in every rupee figure. Estimates: your contract note is "
                "the real number.")
 
+def load_events():
+    """trader/events.json in the repository: [{"date": "YYYY-MM-DD", "time": "HH:MM", "name": "RBI policy"}]."""
+    try:
+        with open(os.path.join(lists.HERE, "trader", "events.json"),
+                  encoding="utf-8") as fh:
+            ev = json.load(fh)
+        return [e for e in ev if isinstance(e, dict) and e.get("date")]
+    except (OSError, ValueError):
+        return []
+
+
+EVENTS = load_events()
 CFG = {"capital": capital, "max_loss": max_loss, "max_trades": int(max_trades), "daily_loss": daily_loss,
-       "min_price": min_price, "max_price": max_price, "shorts": shorts}
+       "min_price": min_price, "max_price": max_price, "shorts": shorts, "events": EVENTS}
 
 
 # ---------------------------------------------------------------- cached data
@@ -479,6 +496,11 @@ def page():
     html(ui.day_strip(counts, int(max_trades), n_today))
     if phase_msg:
         st.info(phase_msg)
+    todays = [e for e in EVENTS if e.get("date") == day.isoformat()]
+    for e in todays:
+        st.warning("Big event today: %s%s. No new trades within %d minutes of it."
+                   % (e.get("name", "event"), (" at " + e["time"]) if e.get("time") else " (no time set: be careful all day)",
+                      engine.DEFAULTS["event_window_min"]))
 
     res = {"picks": [], "watch": [], "skipped": [], "finished": [], "scanned": 0, "checked": 0, "note": "",
            "up": 0, "down": 0, "sectors": {}}
@@ -541,6 +563,87 @@ def page():
          'Free Yahoo data can lag. Not financial advice.</div>')
 
 
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def bt_series(sym, kind, day):
+    try:
+        return backtest.fetch_intraday(sym) if kind == "5m" else backtest.fetch_daily(sym)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def bt_run(symbols, cfg_key, day):
+    cfg = json.loads(cfg_key)
+    for k in ("no_entries_before", "no_entries_after", "flat_by", "early_until", "strong_only_after"):
+        if k in cfg:
+            cfg[k] = datetime.time(*map(int, cfg[k].split(":")))
+    charts = {s_: bt_series(s_, "5m", day) for s_ in symbols}
+    dailies = {s_: bt_series(s_, "1d", day) for s_ in symbols}
+    nifty = bt_series(engine.NIFTY, "5m", day)
+    if not nifty:
+        return None
+    return backtest.run(charts, dailies, nifty, cfg)
+
+
+def backtest_page():
+    now = engine.now_ist()
+    day = now.date()
+    html('<b style="font-size:20px">&#128202; 60-day backtest</b>')
+    st.caption("Replays the scanner's exact rules on the last 60 days of 5-minute data from Yahoo (its limit), "
+               "with Groww charges, and compares the variants we discussed. Evidence, not a promise: no slippage "
+               "beyond candle prices, today's stock list, and no news check for past days.")
+    n = st.select_slider("How many stocks (most traded first)", options=[20, 40, 60, 80], value=40)
+    if not st.button("Run backtest", type="primary", use_container_width=True):
+        st.write("It downloads about %d charts the first time (a few minutes); results are kept for 12 hours." % (2 * n))
+        return
+    syms, note = symbols_for(source, typed, day.isoformat())
+    if not syms:
+        st.error("Could not get the stock list (%s)." % (note or "empty"))
+        return
+    with st.spinner("Choosing stocks..."):
+        daily, _ = daily_data(tuple(syms), day.isoformat())
+        ranked = []
+        for s_ in syms:
+            m = (daily.get(s_) or {}).get("meta") or {}
+            p = m.get("regularMarketPrice")
+            if p and min_price <= p <= max_price:
+                ranked.append((-(p * (m.get("regularMarketVolume") or 0)), s_))
+        chosen = tuple(s_ for _, s_ in sorted(ranked)[:n])
+    if not chosen:
+        st.error("No stocks in your price range.")
+        return
+    cfg = {k: (v.strftime("%H:%M") if isinstance(v, datetime.time) else v) for k, v in CFG.items()}
+    with st.spinner("Downloading and replaying %d stocks x 60 days... (a few minutes the first time)" % len(chosen)):
+        res = bt_run(chosen, json.dumps(cfg, sort_keys=True), day.isoformat())
+    if not res:
+        st.error("Yahoo did not send the Nifty data. Try again in a few minutes.")
+        return
+    tr = res["trades"]
+    yw = backtest.summary(backtest.your_way(tr["phase1"], CFG))
+    html(ui.bt_headline(yw, res["days"], res["stocks"]))
+    st.markdown("**Variants compared** (all signals; *your way* applies 2 trades a day, one at a time)")
+    rows = []
+    for v in backtest.VARIANTS:
+        a = backtest.summary(tr[v])
+        y = backtest.summary(backtest.your_way(tr[v], CFG))
+        rows.append({"Variant": backtest.VARIANT_NAMES[v], "Trades": a.get("trades", 0),
+                     "Win %": a.get("win_rate"), "Total \u20b9": a.get("total"), "Avg \u20b9": a.get("avg"),
+                     "Profit factor": a.get("profit_factor"), "Worst dip \u20b9": a.get("max_drawdown"),
+                     "Your way \u20b9": y.get("total"),
+                     "No retest": a.get("missed") if v == "retest" else None})
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.markdown("**Why breakouts were skipped** (Phase 1 rules)")
+    html(ui.rejected_bars(res.get("rejected")))
+    st.markdown("**Filters** (on Phase 1 signals: win rate and average result with and without)")
+    frows = []
+    for label, yes, no in backtest.filter_table(tr["phase1"]):
+        frows.append({"Condition": label, "With: trades": yes[0], "With: win %": yes[1], "With: avg \u20b9": yes[2],
+                      "Without: trades": no[0], "Without: win %": no[1], "Without: avg \u20b9": no[2]})
+    st.dataframe(frows, use_container_width=True, hide_index=True)
+    st.caption("Read it carefully: a handful of trades proves little. Look for big, consistent gaps over many "
+               "trades before changing a rule.")
+
+
 def results_section(data):
     html('<div class="v1sec">My results (%s)</div>' % ("practice" if mode == "paper" else "real money"))
     res = journal.results(data, mode)
@@ -553,6 +656,9 @@ def results_section(data):
 
 _now = engine.now_ist()
 st.session_state["phase_at_start"] = engine.market_phase(_now)[0]
+if page_choice.startswith("Backtest"):
+    backtest_page()
+    st.stop()
 RUN_EVERY = engine.refresh_seconds(_now) if auto else None     # Option A: 60 s before 9:15, 30 s open, else off
 run_every = RUN_EVERY
 fragment = (lambda f: st.fragment(run_every=run_every)(f)) if (hasattr(st, "fragment") and run_every) else (lambda f: f)

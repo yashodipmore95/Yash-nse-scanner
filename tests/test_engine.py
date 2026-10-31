@@ -77,15 +77,33 @@ class Money(unittest.TestCase):
 
 
 class Analyse(unittest.TestCase):
+    def test_every_factor_has_a_plain_reason(self):
+        for key, _, _ in engine.FACTORS:
+            self.assertIn(key, engine.WEAK_REASON, key)
+            self.assertIn(key, engine.WEAK_REASON_SHORT, key)
+
+    def test_low_score_where_in_play_is_the_weakest(self):
+        rows = [(DAY, "09:15", 300.5, 302.0, 299.0, 301.0, 50000), (DAY, "09:20", 301.0, 302.5, 300.0, 301.5, 30000),
+                (DAY, "09:25", 301.5, 302.0, 300.5, 301.8, 25000), (DAY, "09:30", 301.8, 302.4, 301.5, 302.2, 90000),
+                (DAY, "09:35", 302.3, 302.8, 302.2, 302.55, 10000)]
+        r = engine.analyse("THIN", series(rows), [320.0] * 25, nifty({"09:30": 24900.0, "09:35": 24880.0}), NOW,
+                           news_flag="", cfg={"strict": False})
+        self.assertEqual(r["kind"], "skip")
+        self.assertTrue(r["reason"].startswith("Score "), r["reason"])
+
     def test_strong_buy(self):
         r = engine.analyse("ACMEAUTO", breakout_stock(), DAILY, nifty(), NOW, news_flag="")
         self.assertEqual((r["kind"], r["side"], r["reason"]), ("pick", "buy", None))
         self.assertEqual((r["or_high"], r["or_low"]), (302.5, 299.0))
         self.assertEqual((r["entry"], r["stop"], r["target"], r["lock"]), (304.0, 300.75, 310.5, 307.25))
         pts = {k: p for k, _, p, _ in r["factors"]}
-        self.assertEqual(pts, {"breakout": 2, "volume": 2, "vwap": 1, "relative": 2, "trend": 1, "room": 0,
-                               "market": 1})
-        self.assertEqual((r["score"], r["strength"]), (9, "Strong"))
+        self.assertEqual(pts, {"breakout": 2, "volume": 2, "inplay": 2, "vwap": 1, "relative": 2, "trend": 1,
+                               "room": 0, "market": 1, "early": 1})
+        self.assertEqual((r["raw_score"], r["score"], r["strength"]), (12, 9, "Strong"))   # 12 of 13 -> 9/10
+        self.assertEqual(r["rvol"], 3.7)                                # 1,85,000 vs 50,000 by 9:35 yesterday
+        self.assertIn("in play (3.7", r["why"])
+        self.assertIn("Watch: yesterday's high", r["why"])
+        self.assertEqual(r["lab"]["before_11"], True)
         self.assertEqual((r["qty"], r["signal_time"].time()), (16, datetime.time(9, 40)))
         self.assertEqual(r["exit_by"].time(), datetime.time(10, 40))
         self.assertLessEqual(r["loss_at_stop"], 75)
@@ -106,9 +124,159 @@ class Analyse(unittest.TestCase):
         s["o"][75] = 310.0                                            # a 3% gap up at the open
         self.assertEqual(engine.analyse("X", s, DAILY, nifty(), NOW)["reason"], "Opened with a big gap")
         down = nifty({"09:30": 24900.0, "09:35": 24880.0})
+        r = engine.analyse("X", breakout_stock(), [320.0] * 25, down, NOW, news_flag="", cfg={"strict": False})
+        self.assertEqual(r["kind"], "pick")                           # old rules: weak factors do not kill it
+        self.assertEqual((r["raw_score"], r["score"]), (10, 8))
         r = engine.analyse("X", breakout_stock(), [320.0] * 25, down, NOW, news_flag="")
-        self.assertEqual(r["kind"], "pick")                           # one weak factor does not kill it
-        self.assertEqual(r["score"], 7)
+        self.assertEqual(r["reason"], "Against its daily trend (below the 20-day average)")   # Phase 1
+
+    def test_phase1_must_pass_rules(self):
+        ok = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, news_flag="")
+        self.assertEqual(ok["kind"], "pick")
+        self.assertEqual(ok["volume_ratio"], 6.0)                    # 60,000 vs 10,000 at 9:35 yesterday
+        for key in ("trend", "volume", "candle", "charges"):
+            self.assertIn(key, [k for k, _, _ in ok["checks"]])
+        # weak volume: the same breakout on yesterday-sized volume
+        weak = breakout_stock()
+        weak["v"][75 + 4] = 12000
+        r = engine.analyse("A", weak, DAILY, nifty(), NOW, news_flag="")
+        self.assertEqual(r["reason"], "Weak volume: 1.2\u00d7 normal (needs 1.5\u00d7)")
+        # long upper wick: closes just above the range high, far below its own high
+        wick = breakout_stock()
+        wick["h"][75 + 4], wick["c"][75 + 4] = 306.0, 302.7
+        r = engine.analyse("A", wick, DAILY, nifty(), NOW, news_flag="")
+        self.assertEqual(r["reason"], "Weak candle: long wick or small body")
+        # charges: a tiny target move on a cheap stock
+        r = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, news_flag="",
+                           cfg={"max_charges_share": 0.05})
+        self.assertIn("Charges would take", r["reason"])
+        # events: RBI policy at 9:45 blocks a 9:40 signal, not one an hour later
+        ev = [{"date": DAY.isoformat(), "time": "09:45", "name": "RBI policy"}]
+        r = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, news_flag="", cfg={"events": ev})
+        self.assertEqual(r["reason"], "Big event: RBI policy at 09:45")
+        ev2 = [{"date": DAY.isoformat(), "time": "11:00", "name": "RBI policy"}]
+        self.assertEqual(engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, news_flag="",
+                                        cfg={"events": ev2})["kind"], "pick")
+        self.assertIsNone(engine.event_near([{"date": DAY.isoformat(), "name": "Budget"}], NOW))
+        # 30-minute range and candle-low stop (backtest variants)
+        r = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, news_flag="", cfg={"stop_rule": "candle"})
+        self.assertEqual(r["stop"], 302.15)                           # breakout candle low 302.20 less a tick
+        r30 = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, cfg={"or_bars": 6})
+        self.assertIsNone(r30)                                        # 9:15-9:40 range not complete at 9:41
+
+    def test_new_lab_fields(self):
+        d = [(DAY - datetime.timedelta(days=k), 10.0 + k, 8.0, 9.0, 1) for k in range(8, 0, -1)]
+        self.assertTrue(engine.is_nr7(d))                                      # ranges shrink: last is smallest
+        self.assertFalse(engine.is_nr7(d[:-1] + [(PREV, 20.0, 8.0, 9.0, 1)]))
+        self.assertIsNone(engine.is_nr7(d[:3]))
+        p, lo, hi, w = engine.cpr(305.0, 299.5, 300.0)
+        self.assertAlmostEqual(p, 301.5)
+        self.assertAlmostEqual(lo, 300.75)                                   # top and bottom: 300.75 and 302.25
+        self.assertAlmostEqual(hi, 302.25)
+        self.assertAlmostEqual(w, 0.4975, places=3)                          # 1.50 / 301.50: not narrow
+        self.assertLess(engine.cpr(301.0, 299.0, 300.0)[3], 0.25)             # a quiet day: narrow
+        s_ = breakout_stock()
+        s_["meta"] = {"fiftyTwoWeekHigh": 315.0}
+        r = engine.analyse("X", s_, DAILY, nifty(), NOW, news_flag="")
+        lab = r["lab"]
+        self.assertEqual((lab["near_52w"], lab["narrow_cpr"], lab["open_extreme"]), (True, False, False))
+        self.assertIsNone(lab["nr7"])                                          # no daily chart given
+        s_["meta"] = {"fiftyTwoWeekHigh": 400.0}
+        self.assertFalse(engine.analyse("X", s_, DAILY, nifty(), NOW, news_flag="")["lab"]["near_52w"])
+        self.assertEqual(engine.vix_mood(12.1)[0], "calm")
+        self.assertEqual(engine.vix_mood(15.0)[0], "normal")
+        self.assertEqual(engine.vix_mood(21.0)[0], "high")
+        names = [row[0] for row in journal.lab_stats(journal.empty())]
+        self.assertIn("Yesterday was NR7 (narrowest of 7 days)", names)
+        self.assertEqual(len(names), 8)
+
+    def test_vwap_must_pass(self):
+        rows = flat_day(PREV, 300.0)
+        rows += [(DAY, "09:15", 300.5, 302.0, 299.0, 301.0, 50000), (DAY, "09:20", 301.0, 302.5, 300.0, 301.5, 30000),
+                 (DAY, "09:25", 301.5, 302.0, 300.5, 301.8, 25000),
+                 (DAY, "09:30", 301.8, 330.0, 301.0, 302.0, 900000),     # a huge spike, sold off: VWAP jumps up
+                 (DAY, "09:35", 302.3, 304.2, 302.2, 304.0, 60000)]
+        r = engine.analyse("SPIKE", series(rows), DAILY, nifty(), NOW, news_flag="")
+        self.assertEqual(r["kind"], "skip")
+        self.assertIn("below the day's average price (VWAP", r["reason"])
+        self.assertIn(("vwap", "Above VWAP", False), r["checks"])
+        ok = engine.analyse("ACMEAUTO", breakout_stock(), DAILY, nifty(), NOW, news_flag="")
+        self.assertIn(("vwap", "Above VWAP", True), ok["checks"])
+
+    def test_vwap_exit_variants(self):
+        pick = engine.analyse("ACMEAUTO", breakout_stock(), DAILY, nifty(), NOW, news_flag="")
+        data, _ = journal.add_signal(journal.empty(), pick)
+        sig = data["signals"][0]                       # entry 304.00, stop 300.75, target 310.50, lock 307.25
+        rows = [(DAY, "09:40", 304.0, 307.6, 303.9, 307.4, 40000), (DAY, "09:45", 307.4, 309.0, 307.0, 308.8, 40000),
+                (DAY, "09:50", 308.8, 309.5, 305.0, 305.2, 40000)]
+        t = DT.combine(DAY, datetime.time(9, 55))
+        while t.time() < datetime.time(15, 30):
+            rows.append((DAY, t.strftime("%H:%M"), 305.0, 305.5, 304.5, 305.0, 1000))
+            t += datetime.timedelta(minutes=5)
+        s = breakout_stock(rows)
+        self.assertIsNone(engine.evaluate_variants(sig, s, DT.combine(DAY, datetime.time(12, 0))))   # day not over
+        v = engine.evaluate_variants(sig, s, DT.combine(DAY, datetime.time(15, 31)))
+        self.assertEqual(v["vwap_exit"][0], "close")            # never closed below VWAP, never hit stop or target
+        self.assertEqual(v["vwap_trail"][0], "close")
+        self.assertEqual(engine.evaluate_signal(sig, s, DT.combine(DAY, datetime.time(15, 31)))[0], "time")
+        data, ch = journal.settle_signals(data, {"ACMEAUTO": s}, DT.combine(DAY, datetime.time(15, 31)))
+        x = data["signals"][0]
+        self.assertTrue(ch and x["outcome"] and x["alt"])
+        ex = journal.exit_test(data)
+        self.assertEqual(ex["count"], 1)
+        # a fall below VWAP: the VWAP exit gets out at that candle's close
+        drop = [(DAY, "09:40", 304.0, 304.5, 301.5, 302.0, 400000)] + rows[1:]
+        v = engine.evaluate_variants(sig, breakout_stock(drop), DT.combine(DAY, datetime.time(15, 31)))
+        self.assertEqual(v["vwap_exit"], ("vwap", 302.0))
+
+    def test_range_size_and_afternoon(self):
+        def daily_chart(rng):
+            rows = []
+            for k in range(30):
+                d = PREV - datetime.timedelta(days=30 - k)
+                rows.append((d, "09:15", 300, 300 + rng / 2, 300 - rng / 2, 300, 1000000))
+            return series(rows)
+        loose = {"strict": False}
+        r = engine.analyse("X", breakout_stock(), DAILY, nifty(), NOW, news_flag="", daily_chart=daily_chart(5.0),
+                           cfg=loose)
+        self.assertEqual((r["kind"], r["range_ratio"]), ("pick", 0.7))  # 3.50 range vs 5.00 normal
+        r = engine.analyse("X", breakout_stock(), DAILY, nifty(), NOW, news_flag="", daily_chart=daily_chart(2.0),
+                           cfg=loose)
+        self.assertIn("too wide", r["reason"])
+        r = engine.analyse("X", breakout_stock(), DAILY, nifty(), NOW, news_flag="", daily_chart=daily_chart(20.0),
+                           cfg=loose)
+        self.assertIn("too tiny", r["reason"])
+        # Phase 1: a 5.20 day range against a 5.00 ATR has used 104% of the normal daily move
+        r = engine.analyse("X", breakout_stock(), DAILY, nifty(), NOW, news_flag="", daily_chart=daily_chart(5.0))
+        self.assertEqual((r["kind"], r["atr_used"]), ("skip", 1.04))
+        self.assertIn("Already used 104% of its normal daily move", r["reason"])
+        r = engine.analyse("X", breakout_stock(), DAILY, nifty(), NOW, news_flag="", daily_chart=daily_chart(9.0))
+        self.assertEqual((r["kind"], r["atr_used"]), ("pick", 0.58))
+        rows = flat_day(PREV, 300.0)
+        rows += [(DAY, "09:15", 300.5, 302.0, 299.0, 301.0, 50000), (DAY, "09:20", 301.0, 302.5, 300.0, 301.5, 30000),
+                 (DAY, "09:25", 301.5, 302.0, 300.5, 301.8, 25000)]
+        t = DT.combine(DAY, datetime.time(9, 30))
+        while t.time() < datetime.time(13, 30):
+            rows.append((DAY, t.strftime("%H:%M"), 301.8, 302.3, 301.4, 301.9, 9000))
+            t += datetime.timedelta(minutes=5)
+        rows.append((DAY, "13:30", 302.0, 303.2, 301.9, 303.0, 9000))
+        r = engine.analyse("LATE", series(rows), [320.0] * 25, nifty(), DT.combine(DAY, datetime.time(13, 36)),
+                           news_flag="", cfg={"strict": False})
+        self.assertIn("Afternoon: only strong signals", r["reason"])
+
+    def test_sectors_breadth_and_refresh(self):
+        self.assertEqual(engine.sector_of("Financial Services"), "Bank")
+        self.assertEqual(engine.sector_of("Automobile and Auto Components"), "Auto")
+        self.assertIsNone(engine.sector_of("Textiles"))
+        spark = {"A": breakout_stock(), "B": series(flat_day(PREV, 300.0) + [(DAY, "09:15", 299, 299, 298, 298.5, 1)])}
+        daily = {"A": series([(PREV, "09:15", 0, 0, 0, 300.0, 0)]), "B": series([(PREV, "09:15", 0, 0, 0, 300.0, 0)])}
+        self.assertEqual(engine.breadth(daily, spark, DAY, NOW), (1, 1))
+        self.assertEqual(engine.refresh_seconds(DT.combine(DAY, datetime.time(9, 0))), 60)
+        self.assertEqual(engine.refresh_seconds(DT.combine(DAY, datetime.time(9, 20))), 30)
+        self.assertEqual(engine.refresh_seconds(DT.combine(DAY, datetime.time(15, 31))), None)
+        self.assertEqual(engine.refresh_seconds(DT.combine(datetime.date(2026, 10, 31), datetime.time(10, 0))), None)
+        self.assertEqual(engine.next_open(DT.combine(datetime.date(2026, 10, 30), datetime.time(16, 0))),
+                         datetime.date(2026, 11, 2))                   # Friday after the close -> Monday
 
     def test_after_the_signal(self):
         ran = breakout_stock([(DAY, "09:40", 304.0, 306.0, 303.9, 305.9, 30000)])
@@ -118,7 +286,17 @@ class Analyse(unittest.TestCase):
         r = engine.analyse("X", failed, DAILY, nifty(), DT.combine(DAY, datetime.time(9, 46)))
         self.assertEqual(r["reason"], "Broke out, then fell back to the stop")
         r = engine.analyse("X", breakout_stock(), DAILY, nifty(), DT.combine(DAY, datetime.time(14, 40)))
-        self.assertEqual(r["reason"], "Too late in the day for a new trade")
+        self.assertEqual(r["reason"], "Broke out at 9:40 AM, still running. Too late to enter now (after 2:30 PM)")
+        self.assertTrue(r["signal_valid"])
+        # target first, stop later: a winner, not a loser
+        both = breakout_stock([(DAY, "09:40", 304.0, 311.0, 303.9, 310.8, 1000),
+                               (DAY, "09:45", 310.8, 310.9, 300.0, 300.5, 1000)])
+        r = engine.analyse("X", both, DAILY, nifty(), DT.combine(DAY, datetime.time(9, 51)), news_flag="")
+        self.assertEqual((r["outcome"], r["reason"], r["signal_valid"]), ("target", "Already reached its target", True))
+        # a weak breakout that failed: the signal-time reason wins, the outcome is kept separately
+        weak = breakout_stock([(DAY, "09:40", 304.0, 304.1, 300.5, 300.9, 30000)])
+        r = engine.analyse("X", weak, DAILY, nifty(), DT.combine(DAY, datetime.time(9, 46)), cfg={"capital": 200})
+        self.assertEqual((r["reason"], r["outcome"], r["signal_valid"]), ("Too risky for your capital", "stop", False))
 
     def test_watch_and_shorts(self):
         rows = flat_day(PREV, 300.0)
@@ -133,6 +311,25 @@ class Analyse(unittest.TestCase):
         self.assertEqual((r["kind"], r["side"]), ("pick", "sell"))
         self.assertGreater(r["stop"], r["entry"])
         self.assertLess(r["target"], r["entry"])
+
+    def test_candles_and_heads_up(self):
+        self.assertEqual(engine.candle_key(DT.combine(DAY, datetime.time(9, 45, 15))),
+                         engine.candle_key(DT.combine(DAY, datetime.time(9, 40, 30))))
+        self.assertNotEqual(engine.candle_key(DT.combine(DAY, datetime.time(9, 45, 25))),
+                            engine.candle_key(DT.combine(DAY, datetime.time(9, 45, 15))))
+        self.assertEqual(engine.candle_close(DT.combine(DAY, datetime.time(9, 37, 40))).time(), datetime.time(9, 40))
+        rows = flat_day(PREV, 300.0)
+        rows += [(DAY, "09:15", 300.5, 302.0, 299.0, 301.0, 50000), (DAY, "09:20", 301.0, 302.5, 300.0, 301.5, 30000),
+                 (DAY, "09:25", 301.5, 302.0, 300.5, 301.8, 25000), (DAY, "09:30", 301.8, 302.4, 301.5, 302.2, 20000)]
+        now = DT.combine(DAY, datetime.time(9, 37, 10))
+        w = engine.analyse("NEAR", series(rows), DAILY, nifty(), now)
+        self.assertEqual(w["kind"], "watch")
+        self.assertIsNone(engine.heads_up(w, 302.4, now))             # still under the 302.50 high
+        h = engine.heads_up(w, 303.1, now)
+        self.assertEqual((h["level"], h["closes_at"].time(), h["entry"], h["stop"]), (302.5, datetime.time(9, 40),
+                                                                                    303.1, 300.75))
+        self.assertGreater(h["qty"], 0)
+        self.assertIsNone(engine.heads_up(w, 303.1, DT.combine(DAY, datetime.time(14, 40))))
 
     def test_rank(self):
         a = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, news_flag="")
@@ -201,10 +398,44 @@ class Trades(unittest.TestCase):
         st = engine.trade_status(t, s, n, DT.combine(DAY, datetime.time(14, 56)))
         self.assertIn("square off", st["message"])
 
+    def test_trail_after_lock(self):
+        n = nifty()
+        locked = self.trade(stop=304.0, stop_moved_at="2026-10-29T09:46:00")
+        self.assertEqual(engine.stage_of(locked), 1)
+        s = self.bars_after([(DAY, "09:40", 304.0, 307.5, 303.9, 307.3, 1000),
+                             (DAY, "09:45", 307.3, 309.2, 307.0, 309.0, 1000)])
+        st = engine.trade_status(locked, s, n, DT.combine(DAY, datetime.time(9, 51)))
+        self.assertEqual((st["alert"], st["trail_at"], st["new_stop"]), ("trail", 308.9, 305.6))
+        trailed = dict(locked, stop=305.6, stop_moved_at="2026-10-29T09:51:00")
+        self.assertEqual(engine.stage_of(trailed), 2)
+        st = engine.trade_status(trailed, s, n, DT.combine(DAY, datetime.time(9, 52)))
+        self.assertIsNone(st["alert"])
+        self.assertIn("worst case", st["next"])
+        st = engine.trade_status(self.trade(), s, n, DT.combine(DAY, datetime.time(9, 51)))
+        self.assertEqual((st["alert"], st["new_stop"]), ("lock", 304.0))
+
+    def test_signals_in_the_background(self):
+        pick = engine.analyse("ACMEAUTO", breakout_stock(), DAILY, nifty(), NOW, news_flag="")
+        data, ch = journal.add_signal(journal.empty(), pick)
+        self.assertTrue(ch)
+        self.assertFalse(journal.add_signal(data, pick)[1])            # once per stock per day
+        s = breakout_stock([(DAY, "09:40", 304.0, 311.0, 303.9, 310.8, 1000)])
+        data, ch = journal.settle_signals(data, {"ACMEAUTO": s}, DT.combine(DAY, datetime.time(9, 46)))
+        x = data["signals"][0]
+        self.assertEqual((x["outcome"], x["exit"]), ("target", 310.5))
+        self.assertGreater(x["net"], 0)
+        ss = journal.signal_stats(data)
+        self.assertEqual((ss["count"], ss["win_rate"], ss["strong"]), (1, 100, (1, 100)))
+        flat = breakout_stock([(DAY, "%02d:%02d" % divmod(9 * 60 + 40 + 5 * k, 60), 304.0, 304.6, 303.6, 304.2, 1000)
+                               for k in range(14)])
+        sig = dict(data["signals"][0], outcome=None)
+        self.assertEqual(engine.evaluate_signal(sig, flat, DT.combine(DAY, datetime.time(10, 51)))[0], "time")
+        self.assertIsNone(engine.evaluate_signal(sig, breakout_stock(), NOW))
+
     def test_close_guard_and_results(self):
         data = journal.empty()
-        a = journal.close_trade(self.trade(), 310.5, "target", NOW)
-        b = journal.close_trade(self.trade(), 300.75, "stop", NOW)
+        a = journal.close_trade(dict(self.trade(), signal_entry=303.9), 310.5, "target", NOW, followed=True)
+        b = journal.close_trade(self.trade(signal_entry=304.0), 300.75, "stop", NOW, followed=False)
         self.assertGreater(a["net"], 0)
         self.assertLess(b["net"], 0)
         data = journal.replace(journal.replace(data, a), b)
@@ -215,6 +446,7 @@ class Trades(unittest.TestCase):
         r = journal.results(data, "paper")
         self.assertEqual((r["count"], r["wins"], r["losses"], r["win_rate"]), (2, 1, 1, 50))
         self.assertEqual(len(r["running"]), 2)
+        self.assertEqual((r["discipline"], r["slippage"]), (50, 0.05))
         with self.assertRaises(journal.JournalError):
             journal.close_trade(self.trade(), "abc", "other", NOW)
 
