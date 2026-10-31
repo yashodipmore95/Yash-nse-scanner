@@ -71,6 +71,25 @@ class Manage(unittest.TestCase):
         self.assertAlmostEqual(backtest.charges_legs("buy", 7, 685, [(7, 693)]), engine.charges(7, 685, 693), places=2)
 
 
+class Touch(unittest.TestCase):
+    def test_buy_on_touch_fills_at_the_breakout_price(self):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import test_engine as T
+        rows = T.flat_day(T.PREV, 300.0) + [
+            (T.DAY, "09:15", 300.5, 302.0, 299.0, 301.0, 50000), (T.DAY, "09:20", 301.0, 302.5, 300.0, 301.5, 30000),
+            (T.DAY, "09:25", 301.5, 302.0, 300.5, 301.8, 25000), (T.DAY, "09:30", 301.8, 302.4, 301.5, 302.2, 20000),
+            (T.DAY, "09:35", 302.2, 303.0, 302.0, 302.4, 20000),                  # touches 302.55, closes below
+            (T.DAY, "09:40", 302.4, 306.5, 302.3, 306.3, 30000)]                 # then runs to the target
+        ser = backtest.prepare(T.series(rows))
+        nif = backtest.prepare(T.nifty())
+        win = backtest.window(ser, T.DAY)
+        bars_ = engine.day_bars(win, T.DAY)
+        t = backtest.touch_trade("X", win, T.DAILY, backtest.window(nif, T.DAY), bars_, T.DAY, dict(engine.DEFAULTS),
+                                 None, {})
+        self.assertEqual((t["entry"], t["time"], t["how"]), (302.55, "09:35", "target"))
+        self.assertGreater(t["net"], 0)
+
+
 class Pieces(unittest.TestCase):
     def test_retest(self):
         b = bars([(300, 304.2, 302.2, 304.0, 1000), (304, 304.3, 302.4, 302.9, 1000),

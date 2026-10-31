@@ -355,6 +355,45 @@ class Analyse(unittest.TestCase):
         self.assertIsNone(engine.news_flag("<html", NOW))
 
 
+class ScreenV2(unittest.TestCase):
+    def near_rows(self, last=302.2):
+        rows = flat_day(PREV, 300.0)
+        rows += [(DAY, "09:15", 300.5, 302.0, 299.0, 301.0, 50000), (DAY, "09:20", 301.0, 302.5, 300.0, 301.5, 30000),
+                 (DAY, "09:25", 301.5, 302.0, 300.5, 301.8, 25000), (DAY, "09:30", 301.8, 302.4, 301.5, last, 20000)]
+        return series(rows)
+
+    def test_watch_info(self):
+        now = DT.combine(DAY, datetime.time(9, 36))
+        w = engine.watch_info("NEAR", self.near_rows(), DAILY, nifty(), now)
+        self.assertEqual((w["entry"], w["stop"], w["target"]), (302.55, 300.75, 306.15))
+        self.assertEqual(w["to_go"], 0.35)
+        self.assertGreaterEqual(w["rating"], 5)                      # trend 2 + rising 1 + in play 2 + ...
+        self.assertEqual(w["checks"]["trend"], True)
+        self.assertIsNone(engine.watch_info("NEAR", self.near_rows(), [320.0] * 25, nifty(), now))  # against trend
+        self.assertIsNone(engine.watch_info("FAR", self.near_rows(290.0), DAILY, nifty(), now))     # >2% away
+        self.assertIsNone(engine.watch_info("A", breakout_stock(), DAILY, nifty(), NOW))            # broke out
+
+    def test_bar_state_and_freshness(self):
+        self.assertEqual(engine.bar_state(300.0, 302.55, 1.8), "green")
+        self.assertEqual(engine.bar_state(302.8, 302.55, 1.8), "amber")      # +0.14x risk
+        self.assertEqual(engine.bar_state(303.1, 302.55, 1.8), "orange")     # +0.31x
+        self.assertEqual(engine.bar_state(303.4, 302.55, 1.8), "red")        # +0.47x
+        pick = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, news_flag="")   # entry 304, risk 3.25
+        st, d = engine.freshness(pick, 304.5, DT.combine(DAY, datetime.time(9, 45)))
+        self.assertEqual((st, d["chase_limit"]), ("fresh", 304.65))
+        st, d = engine.freshness(pick, 304.9, DT.combine(DAY, datetime.time(9, 50)))
+        self.assertEqual((st, d["rr_now"]), ("late", 1.35))
+        self.assertEqual(engine.freshness(pick, 306.0, DT.combine(DAY, datetime.time(9, 50)))[0], "missed")
+        self.assertEqual(engine.freshness(pick, 304.2, DT.combine(DAY, datetime.time(10, 20)))[0], "missed")
+
+    def test_premarket_and_mood(self):
+        self.assertEqual(engine.premarket_rating([100 + k * 0.5 for k in range(40)]), 8)   # RSI 100 > 70
+        self.assertIsNone(engine.premarket_rating([1.0] * 10))
+        self.assertEqual(engine.market_mood((14.0, 0), 120, 50, 0.4), ("good", 3))
+        self.assertEqual(engine.market_mood((20.0, 0), 50, 120, -0.5)[0], "weak")
+        self.assertEqual(engine.market_mood(None, 0, 0, 0.0)[0], "mixed")
+
+
 class Trades(unittest.TestCase):
     def trade(self, **kw):
         t = journal.new_trade("ACMEAUTO", "buy", 304.0, 300.75, 16, "paper", DT.combine(DAY, datetime.time(9, 41)))
