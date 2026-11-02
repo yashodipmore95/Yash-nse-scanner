@@ -728,8 +728,15 @@ def page(in_focus=False):
             lp = prices.get(w["symbol"])
             if lp:
                 w = dict(w, price=round(lp, 2), to_go=round(max(w["entry"] - lp, 0.0), 2))
-            (ready if w["price"] >= w["entry"] else watch).append(w)
-        ready.sort(key=lambda w: (-w["rating"], w["price"] - w["entry"]))
+            if w["price"] >= w["entry"]:
+                ready.append(w)
+            elif w["price"] >= w["entry"] * (1 - engine.NEAR_PCT / 100.0):
+                w["near"] = True
+                ready.append(w)
+            else:
+                watch.append(w)
+        # crossing first (best rating), then NEAR (closest first)
+        ready.sort(key=lambda w: (bool(w.get("near")), -w["rating"] if not w.get("near") else w["to_go"]))
         pins = st.session_state.setdefault("pins", set())
         watch.sort(key=lambda w: (w["symbol"] not in pins, -w["rating"], w["to_go"]))
         # picks: freshness from the live price
@@ -762,12 +769,14 @@ def page(in_focus=False):
         if done:
             html(ui.done_card(why, counts))
         elif phase == "open":
-            # 4 get ready
-            if ready:
-                html('<div class="v2sec">&#9889; Get ready</div>')
+            # 4 get ready (always shown)
+            html('<div class="v2sec">&#9889; Get ready</div>')
+            if not ready:
+                html(ui2.getready_empty(min(watch, key=lambda w: w["to_go"]) if watch else None))
+            else:
                 for k, h in enumerate(ready[:3]):
-                    html(ui2.getready(h, k == 0, now))
-                    if k == 0:
+                    html(ui2.getready(h, k == 0, now, near=bool(h.get("near"))))
+                    if k == 0 and not h.get("near"):
                         early_pick = dict(h, entry=engine.snap(h["price"]), qty=engine.size(
                             "buy", engine.snap(h["price"]), h["stop"], capital, max_loss))
                         if st.button("I took this trade (early): %s" % h["symbol"], key="early" + h["symbol"],

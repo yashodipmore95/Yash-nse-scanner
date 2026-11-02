@@ -221,20 +221,25 @@ def rr_row(loss, gain, cost, capital, bt_rate=None):
 
 # ---------------------------------------------------------------- cards
 
-def getready(h, best, now):
+def getready(h, best, now, near=False):
     state = engine.bar_state(h["price"], h["entry"], h["risk"])
     if not best:
-        return ('<div class="v2c v2row" style="opacity:.7"><span class="v2act" style="background:var(--card);'
-                'color:var(--mut)">backup</span><b style="flex:1;font-size:13px">%s</b>%s<div style="width:120px">%s'
-                '</div></div>' % (esc(h["symbol"]), ring(h["rating"], BLUE, 26), price_bar(h["price"], h["entry"],
-                                                                                    h["target"], state, True)))
+        tag = ("NEAR &middot; %s to go" % p2(h["to_go"])) if near else "backup"
+        return ('<div class="v2c v2row" style="opacity:.75"><span class="v2act" style="background:var(--card);'
+                'color:var(--mut)">%s</span><b style="flex:1;font-size:13px">%s</b>%s<div style="width:120px">%s'
+                '</div></div>' % (tag, esc(h["symbol"]), ring(h["rating"], BLUE, 26),
+                                  price_bar(h["price"], h["entry"], h["target"], state, True)))
     secs = (h["closes_at"] - now).total_seconds()
-    badge = {"green": ("WAIT", "a"), "amber": ("WAIT &middot; crossing", "a"), "orange": ("LATE", "a"),
-             "red": ("DON'T CHASE", "r")}[state]
+    if near:
+        badge = ("NEAR &middot; %s to go" % p2(h["to_go"]), "mut")
+    else:
+        badge = {"green": ("WAIT", "a"), "amber": ("WAIT &middot; crossing", "a"), "orange": ("LATE", "a"),
+                 "red": ("DON'T CHASE", "r")}[state]
+    bg = "var(--card)" if near else "var(--bg-%s)" % badge[1]
     return "".join([
-        '<div class="v2c" style="border:2px solid var(--a)"><div class="v2row">',
-        '<span class="v2act" style="background:var(--bg-%s);color:var(--%s)">%s &middot; best now</span>'
-        % (badge[1], badge[1], badge[0]),
+        '<div class="v2c" style="border:2px solid var(--%s)"><div class="v2row">' % ("line" if near else "a"),
+        '<span class="v2act" style="background:%s;color:var(--%s)">%s &middot; best now</span>'
+        % (bg, badge[1], badge[0]),
         '<b style="font-size:15px">%s</b>%s%s</div>' % (esc(h["symbol"]), ring(h["rating"], BLUE, 30), countdown(secs)),
         price_bar(h["price"], h["entry"], h["target"], state), icons(h["checks"]),
         '<div class="v2row v2mut" style="margin-top:4px"><span>%d shares</span><span style="color:var(--r)">stop %s'
@@ -606,3 +611,12 @@ def ranges_forming(items):
     return ('<div class="v2sec">&#9203; Ranges forming</div><div class="v2c">%s<div class="v2mut" style="margin-top:4px">'
             'Opening range so far vs the stock\'s normal daily move (ATR). Dashed line = 0.5&times;. Blue = tradable '
             'size.</div></div>' % "".join(rows))
+
+
+def getready_empty(closest):
+    if not closest:
+        return ('<div class="v2c v2mut">No watchlist stock is near its buy price right now. Stocks show here when '
+                'they come within 0.2%, then again when they cross.</div>')
+    return ('<div class="v2c v2mut">No watchlist stock is crossing its buy price right now &middot; closest: '
+            '<b>%s</b>, %s to go</div>' % (esc(closest["symbol"]), engine.rupees(closest["to_go"]) if closest["to_go"]
+                                            >= 1 else "&#8377;%s" % p2(closest["to_go"])))

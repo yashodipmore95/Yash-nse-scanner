@@ -30,10 +30,12 @@ import datetime
 import engine
 
 BAR = engine.BAR
-VARIANTS = ["phase1", "shorts", "market_filter", "big_moves", "target15", "combo", "touch", "old_rules", "retest",
+VARIANTS = ["phase1", "no_trend", "trend_relaxed", "shorts", "market_filter", "big_moves", "target15", "combo", "touch", "old_rules", "retest",
             "range30", "stop_candle", "half_3r", "vwap_exit", "vwap_trail"]
 VARIANT_NAMES = {
     "phase1": "Phase 1 rules (now)",
+    "no_trend": "Without the daily-trend rule",
+    "trend_relaxed": "Trend rule off on strong market days",
     "shorts": "Shorts on (SELL breakdowns too)",
     "market_filter": "Only with the market (Nifty vs 20-day avg)",
     "big_moves": "Bigger moves only (stop 0.8%+ away)",
@@ -332,10 +334,13 @@ def run(charts, dailies, nifty, cfg, days=None, progress=None):
             bars = engine.day_bars(win, d)
             dchart = dailies.get(sym)
             reg = regime(d)
+            prev_days = [x for x in ndays if x < d]
+            nprev = ncloses[prev_days[-1]] if prev_days else None
             for variant, extra in (("phase1", {}), ("old_rules", {"strict": False}), ("range30", {"or_bars": 6}),
                                    ("stop_candle", {"stop_rule": "candle"}), ("shorts", {"shorts": True}),
                                    ("target15", {"reward_r": 1.5}),
-                                   ("combo_base", {"stop_rule": "candle", "shorts": True})):
+                                   ("combo_base", {"stop_rule": "candle", "shorts": True}),
+                                   ("no_trend", {"trend_rule": False})):
                 r = engine.analyse(sym, win, closes, nwin, now, dict(c, **extra), daily_chart=dchart)
                 if variant == "phase1" and r and r.get("kind") != "watch" and not r.get("signal_valid"):
                     key = reason_group(r.get("signal_reason") or "")
@@ -346,6 +351,9 @@ def run(charts, dailies, nifty, cfg, days=None, progress=None):
                 legs, out_t = manage(bars, k, r["side"], r["entry"], r["stop"], "current", nmap, dict(c, **extra))
                 tr_ = _trade(sym, d, r, r["entry"], r["qty"], legs, out_t)
                 tr_["regime"] = reg
+                tr_["trend_ok"] = {k: p for k, _, p, _ in r["factors"]}.get("trend") == 1
+                n_at = nmap.get(r["signal_time"] - BAR)
+                tr_["n_chg"] = round((n_at / nprev - 1) * 100, 2) if (n_at and nprev) else None
                 trades[variant].append(tr_)
                 if variant != "phase1":
                     continue
@@ -393,6 +401,9 @@ def run(charts, dailies, nifty, cfg, days=None, progress=None):
     trades["market_filter"] = [t for t in trades["phase1"] if with_market(t)]
     trades["big_moves"] = [t for t in trades["phase1"] if big(t)]
     trades["combo"] = [t for t in trades.pop("combo_base") if with_market(t) and big(t)]
+    # strong market day: Nifty at least 0.2% up at the breakout (for a buy)
+    trades["trend_relaxed"] = [t for t in trades["no_trend"]
+                               if t["trend_ok"] or (t.get("n_chg") is not None and t["n_chg"] >= 0.2)]
     up_days = sum(1 for d in all_days if regime(d) == "up")
     known = sum(1 for d in all_days if regime(d) is not None)
     return {"trades": trades, "days": len(all_days), "stocks": len(charts), "rejected": rejected,

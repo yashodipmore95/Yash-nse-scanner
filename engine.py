@@ -90,7 +90,8 @@ DEFAULTS.update({"narrow_cpr_pct": 0.25, "near_52w_pct": 5.0})
 # Phase 1 must-pass rules (strict=False turns them off, for the backtest's "old rules" comparison)
 DEFAULTS.update({"strict": True, "min_volume_x": 1.5, "min_body": 0.5, "min_close_pos": 2.0 / 3.0,
                  "max_atr_used": 0.7, "max_charges_share": 0.25, "event_window_min": 30, "events": [],
-                 "or_bars": 3, "stop_rule": "mid"})
+                 "or_bars": 3, "stop_rule": "mid", "trend_rule": True})
+NEAR_PCT = 0.2           # Get ready shows a watchlist stock as NEAR within 0.2% below its buy price
 DEFAULTS.update({"range_min": 0.25, "range_max": 1.2, "early_until": datetime.time(11, 0),
                  "strong_only_after": datetime.time(13, 0)})
 
@@ -541,7 +542,7 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
     if strict:
         trend_ok = None if not (avg20 and prev_close) else ((prev_close > avg20) if long else (prev_close < avg20))
         checks.append(("trend", "With daily trend", trend_ok))
-        if trend_ok is False:
+        if trend_ok is False and c.get("trend_rule", True):
             reason = reason or ("Against its daily trend (below the 20-day average)" if long
                                 else "Against its daily trend (above the 20-day average)")
         vol_ok = None if vr is None else vr >= c["min_volume_x"]
@@ -1118,7 +1119,8 @@ def watch_info(sym, series, daily, nifty, now, cfg=None, daily_chart=None, secto
         gross = qty * (target - entry)
         ch_share = charges(qty, entry, target) / gross if gross > 0 else 1.0
     worth = None if ch_share is None else ch_share <= c["max_charges_share"]
-    if trend is False or room is False or range_ok is False or not fits or worth is False:
+    if (trend is False and c.get("trend_rule", True)) or room is False or range_ok is False or not fits \
+            or worth is False:
         return None
     cp = cpr(max(x["h"] for x in ybars), min(x["l"] for x in ybars), ybars[-1]["c"]) if ybars else None
     touched = next((b for b in bars[n_or:] if b["h"] >= entry), None)

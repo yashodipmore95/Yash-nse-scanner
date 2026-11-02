@@ -40,8 +40,9 @@ that part says so and the rest works.
    breakout, green = signal score after it), with ▲ for a stock that moved up and NEW for a newcomer.
    Before 9:30 it is a pre-market top 5 rated on daily closes.
 3. Market mood: one needle from India VIX, breadth and Nifty, with the sectors as a colour strip.
-4. ⚡ Get ready: watchlist stocks whose live price is past the buy price but whose candle has not
-   closed. A Now → Buy → Target bar (green below the buy price; amber, orange then red above it),
+4. ⚡ Get ready (always shown; when empty it names the closest watchlist stock): watchlist stocks
+   within 0.2% below their buy price (grey NEAR badge, a minute or two of warning) and stocks whose live
+   price is past the buy price but whose candle has not closed. A Now → Buy → Target bar (green below the buy price; amber, orange then red above it),
    a countdown to the candle close, icon checks, and "I took this trade (early)" (saved with the tag
    Early entry). The best one first, at most two backups.
 5. 🟢 Picks: confirmed signals, freshest first. Fresh: at most 0.2x the risk past the buy price and
@@ -144,7 +145,8 @@ Replays the scanner's exact rules on the last 60 days of 5-minute data (Yahoo's 
 most-traded stocks in range, with Groww charges, managing every trade the way the app does. It shows:
 the Phase 1 result "your way" (2 trades a day, one at a time) with a running-total line; a table of
 results with a "before charges" column (how much Groww's charges cost at your size); a table of
-variants (shorts on, only with the market, bigger moves only, 1.5x target, a combination of those with
+variants (without the daily-trend rule, the trend rule off on strong market days (Nifty up 0.2%+ at the
+breakout), shorts on, only with the market, bigger moves only, 1.5x target, a combination of those with
 the breakout-candle stop, buy on touch with an advance order, old rules, retest entry, 30-minute range, stop below the breakout candle, half at 1.5x with a
 3x trail, VWAP exit, VWAP trail); why breakouts were skipped; and filters with and without (RSI above
 60, MACD expanding, daily ADX above 20, and the filter-lab fields). The first run downloads about two
