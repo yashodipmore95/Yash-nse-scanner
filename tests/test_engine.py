@@ -164,6 +164,13 @@ class Analyse(unittest.TestCase):
         r30 = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, cfg={"or_bars": 6})
         self.assertIsNone(r30)                                        # 9:15-9:40 range not complete at 9:41
 
+    def test_trend_rule_switch(self):
+        down = nifty({"09:30": 24900.0, "09:35": 24880.0})
+        r = engine.analyse("X", breakout_stock(), [320.0] * 25, down, NOW, news_flag="")
+        self.assertEqual(r["reason"], "Against its daily trend (below the 20-day average)")
+        r = engine.analyse("X", breakout_stock(), [320.0] * 25, down, NOW, news_flag="", cfg={"trend_rule": False})
+        self.assertEqual(r["kind"], "pick")                          # the backtest's "without the trend rule"
+
     def test_new_lab_fields(self):
         d = [(DAY - datetime.timedelta(days=k), 10.0 + k, 8.0, 9.0, 1) for k in range(8, 0, -1)]
         self.assertTrue(engine.is_nr7(d))                                      # ranges shrink: last is smallest
