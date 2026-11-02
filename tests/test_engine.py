@@ -377,6 +377,8 @@ class ScreenV2(unittest.TestCase):
         self.assertGreaterEqual(w["rating"], 5)                      # trend 2 + rising 1 + in play 2 + ...
         self.assertEqual(w["checks"]["trend"], True)
         self.assertIsNone(engine.watch_info("NEAR", self.near_rows(), [320.0] * 25, nifty(), now))  # against trend
+        b = engine.watch_info("NEAR", self.near_rows(), [320.0] * 25, nifty(), now, explain=True)
+        self.assertEqual((b["kind"], b["blocked"], b["to_go"]), ("blocked", "below its 20-day average", 0.35))
         self.assertIsNone(engine.watch_info("FAR", self.near_rows(290.0), DAILY, nifty(), now))     # >2% away
         self.assertIsNone(engine.watch_info("A", breakout_stock(), DAILY, nifty(), NOW))            # broke out
 
