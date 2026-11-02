@@ -51,7 +51,9 @@ that part says so and the rest works.
    card has a price ladder, icon checks, a risk vs reward row (lose / win / ratio, wins needed to break
    even, share of capital, backtest win rate for that score once you have run the backtest), a copy box
    and "I took this trade".
-6. 👁 Watchlist (a "⚠ touched X at 10:12, fell back" badge and a rating 2 points lower when the price
+6. 👁 Watchlist (always shown; underneath, a grey "Near, but failing a rule" list shows stocks within
+   2% of their buy price that are not tradable, each with its one reason, e.g. "below its 20-day
+   average"). A "⚠ touched X at 10:12, fell back" badge and a rating 2 points lower when the price
    touched the buy price but no candle closed above it: sellers defended that level): stocks within 2% below their buy price that pass every advance check, by setup rating
    (pinned first). Tap Details to open one (one at a time): countdown, bar, checks, plan, and the two
    ways to buy (A wait for the close, B an advance stop-limit order that buys on touch).

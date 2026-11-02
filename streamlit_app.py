@@ -434,8 +434,10 @@ def scan_market(now, day, key, key30, nifty, data):
         sec_name = industries.get(s_)
         sec = (sec_name, out["sectors"].get(sec_name)) if sec_name else None
         dchart = daily_chart(s_, day.isoformat())
-        w = engine.watch_info(s_, series, closes, nifty, now, CFG, daily_chart=dchart, sector=sec)
-        if w:
+        w = engine.watch_info(s_, series, closes, nifty, now, CFG, daily_chart=dchart, sector=sec, explain=True)
+        if w and w["kind"] == "blocked":
+            out.setdefault("near_blocked", []).append(w)
+        elif w:
             w["_series"], w["_closes"], w["_dchart"] = series, closes, dchart
             out["watch_items"].append(w)
         r = engine.analyse(s_, series, closes, nifty, now, CFG, daily_chart=dchart, sector=sec)
@@ -720,7 +722,8 @@ def page(in_focus=False):
         with st.spinner("Updating..."):
             res = scan_market(now, day, key, key30, nifty, data)
             data = track_signals(load_journal(), res["allpicks"], now, key)
-        live_syms = sorted({w["symbol"] for w in res.get("watch_items", [])} | {r["symbol"] for r in res["picks"]})
+        live_syms = sorted({w["symbol"] for w in res.get("watch_items", [])} | {r["symbol"] for r in res["picks"]} |
+                           {b["symbol"] for b in res.get("near_blocked", [])[:8]})
         prices = live(tuple(live_syms), key30) if (live_syms and phase == "open") else {}
         # split the watch items: live price past the buy price -> Get ready, else the watchlist
         ready, watch = [], []
@@ -798,9 +801,11 @@ def page(in_focus=False):
                 if st.button("I took this trade (late): %s" % r["symbol"], key="late" + r["symbol"],
                              use_container_width=True):
                     took_dialog(dict(r, entry=d["price"], qty=d["qty_now"]))
-            # 6 watchlist
+            # 6 watchlist (always shown)
+            html('<div class="v2sec">&#128065; Watchlist</div>')
+            if not watch:
+                html('<div class="v2c v2mut">No stock near its buy price passes every advance check right now.</div>')
             if watch:
-                html('<div class="v2sec">&#128065; Watchlist</div>')
                 open_sym = st.session_state.get("open_watch")
                 for w in watch[:8]:
                     is_open = w["symbol"] == open_sym
@@ -820,6 +825,13 @@ def page(in_focus=False):
                             st.rerun()
                 if len(watch) > 8:
                     html('<div class="v2mut">+ %d more within 2%% of their buy price</div>' % (len(watch) - 8))
+            # live price for the near-but-blocked stocks, then the grey list
+            nb = res.get("near_blocked", [])
+            for b in nb:
+                lp = prices.get(b["symbol"])
+                if lp:
+                    b["price"], b["to_go"] = round(lp, 2), round(max(b["entry"] - lp, 0.0), 2)
+            html(ui2.near_blocked(sorted(nb, key=lambda b: b["to_go"])[:8], len(nb)))
         # 7 folded lists
         if res["finished"]:
             wins = sum(1 for r in res["finished"] if r["outcome"] == "target")

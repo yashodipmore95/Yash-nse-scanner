@@ -620,3 +620,16 @@ def getready_empty(closest):
     return ('<div class="v2c v2mut">No watchlist stock is crossing its buy price right now &middot; closest: '
             '<b>%s</b>, %s to go</div>' % (esc(closest["symbol"]), engine.rupees(closest["to_go"]) if closest["to_go"]
                                             >= 1 else "&#8377;%s" % p2(closest["to_go"])))
+
+
+def near_blocked(items, total):
+    """Stocks near their buy price that fail an advance rule: shown greyed, with the one reason."""
+    if not items:
+        return ""
+    rows = "".join('<div class="v2row" style="font-size:12px;margin:3px 0;opacity:.8"><span style="width:96px">%s</span>'
+                   '<span class="v2mut">%s to go</span><span style="color:var(--r);font-size:11px">&#10007; %s</span>'
+                   '</div>' % (esc(b["symbol"]), engine.rupees(b["to_go"]) if b["to_go"] >= 1 else "&#8377;%s"
+                               % p2(b["to_go"]), esc(b["blocked"])) for b in items)
+    more = ('<div class="v2mut">+ %d more</div>' % (total - len(items))) if total > len(items) else ""
+    return ('<div class="v2c" style="background:transparent"><div class="v2mut" style="margin-bottom:3px">Near, but '
+            'failing a rule (not tradable)</div>%s%s</div>' % (rows, more))

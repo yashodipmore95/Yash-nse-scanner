@@ -1065,7 +1065,7 @@ def stage_one(spark_5m, now, cfg=None, near_pct=WATCH_PCT):
 
 
 
-def watch_info(sym, series, daily, nifty, now, cfg=None, daily_chart=None, sector=None, live=None):
+def watch_info(sym, series, daily, nifty, now, cfg=None, daily_chart=None, sector=None, live=None, explain=False):
     """A stock that has NOT broken out yet: its setup rating (0-10, before the breakout), the checks that
     can be known in advance, and the trade plan if it triggers. None if it is not a watch candidate.
 
@@ -1119,9 +1119,23 @@ def watch_info(sym, series, daily, nifty, now, cfg=None, daily_chart=None, secto
         gross = qty * (target - entry)
         ch_share = charges(qty, entry, target) / gross if gross > 0 else 1.0
     worth = None if ch_share is None else ch_share <= c["max_charges_share"]
-    if (trend is False and c.get("trend_rule", True)) or room is False or range_ok is False or not fits \
-            or worth is False:
+    blocked = None
+    if trend is False and c.get("trend_rule", True):
+        blocked = "below its 20-day average"
+    elif room is False:
+        blocked = "used %d%% of its daily move" % round(atr_used * 100)
+    elif range_ok is False:
+        blocked = "range too wide" if range_ratio > c["range_max"] else "range too tiny"
+    elif not fits:
+        blocked = ("price outside \u20b9%g\u2013%g" % (c["min_price"], c["max_price"])
+                   if not (c["min_price"] <= entry <= c["max_price"]) else "too risky for your capital")
+    elif worth is False:
+        blocked = "charges too big for the move"
+    if blocked and not explain:
         return None
+    if blocked:
+        return {"symbol": sym, "kind": "blocked", "blocked": blocked, "price": round(price, 2), "entry": entry,
+                "to_go": round(max(entry - price, 0.0), 2)}
     cp = cpr(max(x["h"] for x in ybars), min(x["l"] for x in ybars), ybars[-1]["c"]) if ybars else None
     touched = next((b for b in bars[n_or:] if b["h"] >= entry), None)
     day_high = ((series.get("meta") or {}).get("regularMarketDayHigh") if not touched else None)
