@@ -305,7 +305,8 @@ LAB = [("before_11", "Breakout before 11 AM", "after 11 AM"), ("in_play", "In pl
        ("nr7", "Yesterday was NR7 (narrowest of 7 days)", "not NR7"),
        ("narrow_cpr", "Narrow CPR today", "normal or wide CPR"),
        ("open_extreme", "Opened at the day's low (high for a short)", "did not"),
-       ("near_52w", "Within 5% of the 52-week high", "further away")]
+       ("near_52w", "Within 5% of the 52-week high", "further away"),
+       ("failed_touch", "Breakout after an earlier failed touch", "first attempt")]
 
 
 def lab_stats(data):

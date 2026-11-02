@@ -279,10 +279,14 @@ def watch_row(w, is_open):
         line = ('<svg viewBox="0 0 70 20" width="70" height="20"><line x1="0" y1="%.1f" x2="70" y2="%.1f" '
                 'stroke="%s" stroke-dasharray="2 2"/><polyline fill="none" stroke="currentColor" stroke-opacity=".6" '
                 'stroke-width="1.5" points="%s"/></svg>' % (ty, ty, BLUE, poly))
-    return ('<div class="v2c v2row" style="%s;margin-bottom:0">%s<b style="flex:1;font-size:13px">%s</b>%s'
-            '<span class="v2mut" style="text-align:right">%s<br>to go</span></div>'
-            % ("border:2px solid var(--b)" if is_open else "", ring(w["rating"], BLUE, 28), esc(w["symbol"]), line,
-               engine.rupees(w["to_go"]) if w["to_go"] >= 1 else "&#8377;%s" % p2(w["to_go"])))
+    badge = ""
+    if w.get("touched_at"):
+        badge = ('<div style="font-size:10px;color:var(--a)">&#9888; touched %s at %s, fell back</div>'
+                 % (p2(w["entry"]), engine.hhmm(w["touched_at"].time())))
+    return ('<div class="v2c v2row" style="%s;margin-bottom:0">%s<div style="flex:1"><b style="font-size:13px">%s</b>'
+            '%s</div>%s<span class="v2mut" style="text-align:right">%s<br>to go</span></div>'
+            % ("border:2px solid var(--b)" if is_open else "", ring(w["rating"], BLUE, 28), esc(w["symbol"]), badge,
+               line, engine.rupees(w["to_go"]) if w["to_go"] >= 1 else "&#8377;%s" % p2(w["to_go"])))
 
 
 def watch_detail(w, now):
@@ -292,6 +296,10 @@ def watch_detail(w, now):
         '<div class="v2c" style="margin-top:0;border-top:none;border-radius:0 0 12px 12px">',
         '<div class="v2row"><span class="v2act" style="background:var(--card);color:var(--mut)">WAIT</span>'
         '<span class="v2mut">candle closes in</span>%s</div>' % countdown(secs),
+        ('<div style="background:var(--bg-a);color:var(--a);border-radius:6px;padding:5px 8px;font-size:12px;'
+         'margin:4px 0">&#9888; Touched %s at %s and fell back: sellers defended this level. Rating lowered by 2. '
+         'Wait for a proper candle close with strong volume.</div>'
+         % (p2(w["entry"]), engine.hhmm(w["touched_at"].time()))) if w.get("touched_at") else "",
         price_bar(w["price"], w["entry"], w["target"], state), icons(w["checks"]),
         '<div class="v2row v2mut" style="margin-top:4px"><span>%d shares</span><span style="color:var(--r)">stop %s'
         '</span><span>target %s</span><span>1 : %.1f</span></div>'

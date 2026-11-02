@@ -30,9 +30,15 @@ import datetime
 import engine
 
 BAR = engine.BAR
-VARIANTS = ["phase1", "touch", "old_rules", "retest", "range30", "stop_candle", "half_3r", "vwap_exit", "vwap_trail"]
+VARIANTS = ["phase1", "shorts", "market_filter", "big_moves", "target15", "combo", "touch", "old_rules", "retest",
+            "range30", "stop_candle", "half_3r", "vwap_exit", "vwap_trail"]
 VARIANT_NAMES = {
     "phase1": "Phase 1 rules (now)",
+    "shorts": "Shorts on (SELL breakdowns too)",
+    "market_filter": "Only with the market (Nifty vs 20-day avg)",
+    "big_moves": "Bigger moves only (stop 0.8%+ away)",
+    "target15": "Target 1.5x instead of 2x",
+    "combo": "Combo: candle stop + shorts + market + big moves",
     "touch": "Buy on touch (order in advance)",
     "old_rules": "Old rules (before Phase 1)",
     "retest": "Entry: wait for the retest",
@@ -249,6 +255,18 @@ def settle(side, qty, entry, legs):
     return round(gross - charges_legs(side, qty, entry, shares), 2)
 
 
+def gross_of(side, qty, entry, legs):
+    if qty < 1:
+        return None
+    if len(legs) == 2 and qty >= 2:
+        q1 = qty // 2
+        shares = [(q1, legs[0][1]), (qty - q1, legs[1][1])]
+    else:
+        price = sum(f * p for f, p, _ in legs) / max(sum(f for f, _, _ in legs), 1e-9)
+        shares = [(qty, price)]
+    return round(sum(q * ((p - entry) if side == "buy" else (entry - p)) for q, p in shares), 2)
+
+
 def find_retest(bars, i, side, level, stop, look=6):
     """Index of the first candle within `look` candles after the breakout that dips back to the broken
     level and closes firmly beyond it, or None (no retest, or the stop came first)."""
@@ -279,7 +297,20 @@ def run(charts, dailies, nifty, cfg, days=None, progress=None):
     if days:
         all_days = all_days[-days:]
     trades = {v: [] for v in VARIANTS}
+    trades["combo_base"] = []
     rejected = {}
+    ncloses = {}
+    for dd in (nifty or {}).get("_days", []):
+        nb = engine.day_bars(nifty, dd)
+        if nb:
+            ncloses[dd] = nb[-1]["c"]
+    ndays = sorted(ncloses)
+
+    def regime(day):
+        prev = [ncloses[x] for x in ndays if x < day]
+        if len(prev) < 20:
+            return None
+        return "up" if prev[-1] > sum(prev[-20:]) / 20.0 else "down"
     total = len(all_days) * max(len(charts), 1)
     done = 0
     for d in all_days:
@@ -300,8 +331,11 @@ def run(charts, dailies, nifty, cfg, days=None, progress=None):
             win = window(ser, d, meta=meta)
             bars = engine.day_bars(win, d)
             dchart = dailies.get(sym)
+            reg = regime(d)
             for variant, extra in (("phase1", {}), ("old_rules", {"strict": False}), ("range30", {"or_bars": 6}),
-                                   ("stop_candle", {"stop_rule": "candle"})):
+                                   ("stop_candle", {"stop_rule": "candle"}), ("shorts", {"shorts": True}),
+                                   ("target15", {"reward_r": 1.5}),
+                                   ("combo_base", {"stop_rule": "candle", "shorts": True})):
                 r = engine.analyse(sym, win, closes, nwin, now, dict(c, **extra), daily_chart=dchart)
                 if variant == "phase1" and r and r.get("kind") != "watch" and not r.get("signal_valid"):
                     key = reason_group(r.get("signal_reason") or "")
@@ -309,8 +343,10 @@ def run(charts, dailies, nifty, cfg, days=None, progress=None):
                 if not r or r.get("kind") == "watch" or not r.get("signal_valid"):
                     continue
                 k = r["trigger_index"]
-                legs, out_t = manage(bars, k, r["side"], r["entry"], r["stop"], "current", nmap, c)
-                trades[variant].append(_trade(sym, d, r, r["entry"], r["qty"], legs, out_t))
+                legs, out_t = manage(bars, k, r["side"], r["entry"], r["stop"], "current", nmap, dict(c, **extra))
+                tr_ = _trade(sym, d, r, r["entry"], r["qty"], legs, out_t)
+                tr_["regime"] = reg
+                trades[variant].append(tr_)
                 if variant != "phase1":
                     continue
                 for mode in ("half_3r", "vwap_exit", "vwap_trail"):
@@ -348,7 +384,19 @@ def run(charts, dailies, nifty, cfg, days=None, progress=None):
                 trades["touch"].append(t)
     if progress:
         progress(1.0)
-    return {"trades": trades, "days": len(all_days), "stocks": len(charts), "rejected": rejected}
+
+    def with_market(t):
+        return t.get("regime") is not None and ((t["side"] == "buy") == (t["regime"] == "up"))
+
+    def big(t):
+        return (t.get("risk_pct") or 0) >= 0.8
+    trades["market_filter"] = [t for t in trades["phase1"] if with_market(t)]
+    trades["big_moves"] = [t for t in trades["phase1"] if big(t)]
+    trades["combo"] = [t for t in trades.pop("combo_base") if with_market(t) and big(t)]
+    up_days = sum(1 for d in all_days if regime(d) == "up")
+    known = sum(1 for d in all_days if regime(d) is not None)
+    return {"trades": trades, "days": len(all_days), "stocks": len(charts), "rejected": rejected,
+            "regime_days": (up_days, known)}
 
 
 REASON_GROUPS = [("Weak volume", "Weak volume"), ("Weak candle", "Weak candle (wick or small body)"),
@@ -410,7 +458,8 @@ def _trade(sym, d, r, entry, qty, legs, out_t):
     return {"symbol": sym, "date": d.isoformat(), "time": r["signal_time"].strftime("%H:%M"), "side": r["side"],
             "score": r["score"], "entry": entry, "exit": round(price, 2), "qty": qty,
             "how": " + ".join(h for _, _, h in legs), "net": settle(r["side"], qty, entry, legs),
-            "exit_time": out_t.strftime("%H:%M")}
+            "gross": gross_of(r["side"], qty, entry, legs), "exit_time": out_t.strftime("%H:%M"),
+            "risk_pct": round(100.0 * abs(entry - r["stop"]) / entry, 3) if r.get("stop") else None}
 
 
 # ---------------------------------------------------------------- results
@@ -454,7 +503,9 @@ def summary(trades):
         peak = max(peak, eq)
         dd = min(dd, eq - peak)
     gross_win, gross_loss = sum(wins), -sum(losses)
+    gross_total = round(sum(t.get("gross") or 0 for t in done), 2)
     return {"trades": len(done), "missed": missed, "win_rate": round(100.0 * len(wins) / len(done)),
+            "gross_total": gross_total, "charges_total": round(gross_total - sum(t["net"] for t in done), 2),
             "total": round(eq, 2), "avg": round(eq / len(done), 2),
             "avg_win": round(gross_win / len(wins), 2) if wins else 0.0,
             "avg_loss": round(-gross_loss / len(losses), 2) if losses else 0.0,

@@ -486,7 +486,7 @@ def focus_tile(t, st):
     nifty = st.get("nifty_since")
     left, right = ("Stop", "Target") if long else ("Target", "Stop")
     return "".join([
-        '<div class="v1mut" style="margin:6px 0">&#127919; Focus mode &middot; new picks paused while this trade is open</div>',
+        '<div class="v1mut" style="margin:6px 0">&#127919; Your open trade (the scanner keeps running below if switched on)</div>',
         '<div class="v1card v1b">',
         '<div class="v1row"><b style="font-size:17px">%s%s</b><span class="v1pill" style="background:var(--bg-b);'
         'color:var(--b)">%s &middot; %d shares</span></div>'

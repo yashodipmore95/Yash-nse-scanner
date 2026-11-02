@@ -50,7 +50,8 @@ that part says so and the rest works.
    card has a price ladder, icon checks, a risk vs reward row (lose / win / ratio, wins needed to break
    even, share of capital, backtest win rate for that score once you have run the backtest), a copy box
    and "I took this trade".
-6. 👁 Watchlist: stocks within 2% below their buy price that pass every advance check, by setup rating
+6. 👁 Watchlist (a "⚠ touched X at 10:12, fell back" badge and a rating 2 points lower when the price
+   touched the buy price but no candle closed above it: sellers defended that level): stocks within 2% below their buy price that pass every advance check, by setup rating
    (pinned first). Tap Details to open one (one at a time): countdown, bar, checks, plan, and the two
    ways to buy (A wait for the close, B an advance stop-limit order that buys on touch).
 7. Folded lists: Finished today and Skipped right now.
@@ -101,6 +102,12 @@ confirmed entries, signals you took vs skipped, then all signals, the filter lab
 
 ## While you are in a trade (focus mode)
 
+- Your trade panel sits on top and refreshes every 15 seconds. Below it, "Keep scanning other stocks
+  while in this trade" (on by default) keeps the scanner running every 30 seconds, so you can watch and
+  even take another pick. The app warns you when a second trade needs more than your free cash.
+- Without the GitHub journal, today's trades are kept in the page's address, so a reload or a phone
+  lock does not lose your open trade. Older days still need the journal (or Journal backup).
+
 - While a trade is open, only the trade panel refreshes (every 30 seconds); the rest of the page
   stays still and the market scan pauses until you close the trade.
 - After **I took this trade**, the page shows only that trade until you close it: live price,
@@ -136,7 +143,9 @@ results stay positive after charges.
 Replays the scanner's exact rules on the last 60 days of 5-minute data (Yahoo's limit) for your
 most-traded stocks in range, with Groww charges, managing every trade the way the app does. It shows:
 the Phase 1 result "your way" (2 trades a day, one at a time) with a running-total line; a table of
-variants (buy on touch with an advance order, old rules, retest entry, 30-minute range, stop below the breakout candle, half at 1.5x with a
+results with a "before charges" column (how much Groww's charges cost at your size); a table of
+variants (shorts on, only with the market, bigger moves only, 1.5x target, a combination of those with
+the breakout-candle stop, buy on touch with an advance order, old rules, retest entry, 30-minute range, stop below the breakout candle, half at 1.5x with a
 3x trail, VWAP exit, VWAP trail); why breakouts were skipped; and filters with and without (RSI above
 60, MACD expanding, daily ADX above 20, and the filter-lab fields). The first run downloads about two
 charts per stock and takes a few minutes; results are kept for 12 hours. Limits: no slippage beyond

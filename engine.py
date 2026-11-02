@@ -620,7 +620,8 @@ def analyse(sym, series, daily, nifty, now, cfg=None, news_flag=None, daily_char
                     "narrow_cpr": (cp[3] < c["narrow_cpr_pct"]) if cp else None,
                     "cpr_width": round(cp[3], 3) if cp else None,
                     "open_extreme": open_extreme,
-                    "near_52w": near52},
+                    "near_52w": near52,
+                    "failed_touch": any((x["h"] > or_high) if long else (x["l"] < or_low) for x in bars[n_or:i])},
                sector=sector)
     out["why"] = why_line(out)
     return out
@@ -1120,6 +1121,11 @@ def watch_info(sym, series, daily, nifty, now, cfg=None, daily_chart=None, secto
     if trend is False or room is False or range_ok is False or not fits or worth is False:
         return None
     cp = cpr(max(x["h"] for x in ybars), min(x["l"] for x in ybars), ybars[-1]["c"]) if ybars else None
+    touched = next((b for b in bars[n_or:] if b["h"] >= entry), None)
+    day_high = ((series.get("meta") or {}).get("regularMarketDayHigh") if not touched else None)
+    touched_at = (touched["start"] + BAR) if touched else None
+    if not touched and day_high and float(day_high) >= entry and price < entry:
+        touched_at = now                                   # touched between refreshes (from the day's high)
     pts = 0
     pts += 2 if trend else 0
     pts += 1 if sma_rising(daily or []) else 0
@@ -1129,9 +1135,12 @@ def watch_info(sym, series, daily, nifty, now, cfg=None, daily_chart=None, secto
     pts += 1 if range_ok else 0
     pts += 1 if (atr_used is not None and atr_used < 0.5) else 0
     pts += 1 if ((rows and is_nr7(rows)) or (cp and cp[3] < c["narrow_cpr_pct"])) else 0
+    if touched_at and price < entry:
+        pts -= 2                                           # sellers defended the level once: rank it lower
     loss = -net("buy", qty, entry, stop)
     gain = net("buy", qty, entry, target)
-    return {"symbol": sym, "kind": "watch", "side": "buy", "rating": min(pts, 10), "price": round(price, 2),
+    return {"symbol": sym, "kind": "watch", "side": "buy", "rating": max(0, min(pts, 10)), "price": round(price, 2),
+            "touched_at": touched_at if (touched_at and price < entry) else None,
             "or_high": or_high, "or_low": or_low, "entry": entry, "stop": stop, "target": target,
             "lock": snap(entry + risk, ref=entry), "risk": round(risk, 2), "qty": qty,
             "loss": loss, "gain": gain, "to_go": round(max(entry - price, 0.0), 2),

@@ -8,12 +8,14 @@ orders and never asks for a broker login. A pick is a chart that matched rules, 
 Not financial advice.
 """
 
+import base64
 import datetime
 import hashlib
 import hmac
 import json
 import os
 import time
+import zlib
 
 import streamlit as st
 
@@ -114,28 +116,56 @@ def store():
     return None
 
 
+def url_pack(data):
+    """Today's trades and any open trade, compressed for the page address (survives a reload)."""
+    today = engine.now_ist().date().isoformat()
+    keep = [t for t in data.get("trades", []) if t.get("status") == "open" or t.get("date") == today]
+    raw = json.dumps({"v": 1, "trades": keep}, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode("ascii").rstrip("=")
+
+
+def url_unpack(text):
+    try:
+        pad = "=" * (-len(text) % 4)
+        doc = json.loads(zlib.decompress(base64.urlsafe_b64decode(text + pad)).decode("utf-8"))
+        if isinstance(doc.get("trades"), list):
+            return {"version": 1, "trades": doc["trades"]}
+    except Exception:
+        pass
+    return None
+
+
 def load_journal():
     if "journal" not in st.session_state:
-        s = store()
+        s_ = store()
         data = journal.empty()
-        if s:
+        if s_:
             try:
-                data = s.load()
+                data = s_.load()
             except journal.JournalError as e:
                 st.session_state["journal_error"] = str(e)
+        else:
+            packed = st.query_params.get("j")            # no GitHub journal: today's trades ride in the address
+            if packed:
+                data = url_unpack(packed) or data
         st.session_state["journal"] = data
     return st.session_state["journal"]
 
 
 def save_journal(data, message):
     st.session_state["journal"] = data
-    s = store()
-    if s:
+    s_ = store()
+    if s_:
         try:
-            s.save(data, message)
+            s_.save(data, message)
             st.session_state.pop("journal_error", None)
         except journal.JournalError as e:
             st.session_state["journal_error"] = str(e)
+    else:
+        try:
+            st.query_params["j"] = url_pack(data)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- settings (side panel)
@@ -330,6 +360,11 @@ def took_dialog(pick, early=False):
     st.caption("Break-even \u20b9%s \u00b7 Cost %s \u00b7 Exit by 2:55 PM at the latest"
                % (ui.p2(mp["break_even"]), engine.rupees(mp["cost"])))
     st.code(ui.order_text(pick["symbol"], pick["side"], int(qty), entry, stop, mp["target"]), language=None)
+    used = sum(t["entry"] * t["qty"] for t in journal.open_trades(load_journal(), mode))
+    if used and mp["cost"] > capital - used + 0.005:
+        st.warning("Your open trade already uses %s of your %s capital; only %s is free. Buying this needs margin "
+                   "(MIS leverage) or a smaller size, and a second loss counts toward your daily limit."
+                   % (engine.rupees(used), engine.rupees(capital), engine.rupees(max(capital - used, 0))))
     fit = engine.size(pick["side"], entry, stop, capital, max_loss)
     if mp["loss"] > max_loss + 0.005 or mp["cost"] > capital + 0.005:
         st.warning("This is over your limits (max loss %s, capital %s). Reduce to %d shares."
@@ -487,8 +522,8 @@ def journal_note():
     if st.session_state.get("journal_error"):
         return "Journal not saved to GitHub: %s" % st.session_state["journal_error"]
     if not store():
-        return ("Journal not set up: trades are kept only while this page is open. See README, \"Keep your trades "
-                "safe\" (GITHUB_TOKEN and JOURNAL_REPO in Secrets).")
+        return ("Journal not set up: today's trades are kept in this page's address (a reload or phone lock keeps "
+                "them), but older days are not saved. See README, \"Keep your trades safe\".")
     return None
 
 
@@ -516,10 +551,13 @@ def focus_panel():
     opens = journal.open_trades(load_journal(), mode)
     if not opens:                                   # closed in another tab: back to the full page
         st.rerun()
+    key15 = "%s-%d" % (now.strftime("%Y%m%d%H%M") + str(now.second // 15), st.session_state.get("bump", 0))
     nifty = chart(engine.NIFTY, key) if phase in ("open", "forming", "after") else None
-    html('<div class="v1mut" style="text-align:right">&#8635; Updated %s</div>' % now.strftime("%I:%M:%S %p").lstrip("0"))
+    html('<div class="v1mut" style="text-align:right">&#8635; Updated %s &middot; every %s</div>'
+         % (now.strftime("%I:%M:%S %p").lstrip("0"), "15 s" if FOCUS_EVERY == 15 else
+            ("%d s" % FOCUS_EVERY if FOCUS_EVERY else "manual")))
     for t in opens:
-        focus(t, now, key, key30, nifty, phase)
+        focus(t, now, key, key15, nifty, phase)
 
 
 def premarket_top(day):
@@ -652,7 +690,7 @@ def bt_rate(score):
     return rates.get(score)
 
 
-def page():
+def page(in_focus=False):
     renew_login()
     now = engine.now_ist()
     day = now.date()
@@ -661,14 +699,17 @@ def page():
     phase, phase_msg = engine.market_phase(now)
     if phase != st.session_state.get("phase_at_start"):      # e.g. 9:15 or 3:30 passed: reset the schedule
         st.rerun()
-    if journal.open_trades(data, mode):            # a trade was just opened: switch to focus mode
+    if journal.open_trades(data, mode) and not in_focus:   # a trade was just opened: switch to focus mode
         st.rerun()
     status = [schedule_message(now, phase, phase_msg)] if phase_msg else []
     for e in [e for e in EVENTS if e.get("date") == day.isoformat()]:
         status.append("Big event today: %s%s" % (e.get("name", "event"), (" at " + e["time"]) if e.get("time") else ""))
 
-    # 1 header
-    header(now)
+    # 1 header (in a trade, the focus panel above already has it)
+    if not in_focus:
+        header(now)
+    else:
+        html('<div class="v2sec">&#128064; Still scanning (refreshes every 30 s)</div>')
     nifty = chart(engine.NIFTY, key) if phase in ("open", "forming", "after") else None
     done, why, counts = journal.guard(data, mode, day, CFG)
 
@@ -903,11 +944,16 @@ def backtest_page():
         a = backtest.summary(tr[v])
         y = backtest.summary(backtest.your_way(tr[v], CFG))
         rows.append({"Variant": backtest.VARIANT_NAMES[v], "Trades": a.get("trades", 0),
-                     "Win %": a.get("win_rate"), "Total \u20b9": a.get("total"), "Avg \u20b9": a.get("avg"),
+                     "Win %": a.get("win_rate"), "Total \u20b9": a.get("total"),
+                     "Before charges \u20b9": a.get("gross_total"), "Avg \u20b9": a.get("avg"),
                      "Profit factor": a.get("profit_factor"), "Worst dip \u20b9": a.get("max_drawdown"),
                      "Your way \u20b9": y.get("total"),
                      "No retest": a.get("missed") if v == "retest" else None})
     st.dataframe(rows, use_container_width=True, hide_index=True)
+    up_days, known = res.get("regime_days", (0, 0))
+    if known:
+        st.caption("Market filter: Nifty was above its 20-day average on %d of %d days that could be measured "
+                   "(the first 20 days of data are needed to start the average)." % (up_days, known))
     st.markdown("**Why breakouts were skipped** (Phase 1 rules)")
     html(ui.rejected_bars(res.get("rejected")))
     st.markdown("**Filters** (on Phase 1 signals: win rate and average result with and without)")
@@ -939,16 +985,27 @@ if page_choice.startswith("My progress"):
     progress_page()
     st.stop()
 RUN_EVERY = engine.refresh_seconds(_now) if auto else None     # Option A: 60 s before 9:15, 30 s open, else off
+FOCUS_EVERY = 15 if RUN_EVERY == 30 else RUN_EVERY           # your open trade: every 15 s in market hours
 run_every = RUN_EVERY
-fragment = (lambda f: st.fragment(run_every=run_every)(f)) if (hasattr(st, "fragment") and run_every) else (lambda f: f)
+
+
+def every(seconds):
+    if hasattr(st, "fragment") and seconds:
+        return lambda f: st.fragment(run_every=seconds)(f)
+    return lambda f: f
+
+
+fragment = every(RUN_EVERY)
 _data = load_journal()
 if journal.open_trades(_data, mode):
-    # Focus mode: the header, day bar and results stay still; only the trade panel refreshes.
+    # Focus mode: your trade panel on top (every 15 s); the scanner can keep running below it (every 30 s).
     header(_now, clock=False)
     _phase, _msg = engine.market_phase(_now)
     _done, _why, _counts = journal.guard(_data, mode, _now.date(), CFG)
     html(ui.day_strip(_counts, int(max_trades), []))
-    fragment(focus_panel)()
+    every(FOCUS_EVERY)(focus_panel)()
+    if st.toggle("\U0001F440 Keep scanning other stocks while in this trade", value=True, key="scan_in_trade"):
+        every(RUN_EVERY)(lambda: page(in_focus=True))()
 else:
     fragment(page)()
 
