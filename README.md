@@ -20,6 +20,19 @@ tests/test_engine.py      offline tests on made-up data
 requirements.txt          streamlit>=1.37
 ```
 
+## Before 9:35: the opening view
+
+From the morning until the first signals, the home page shows: a countdown (to 9:15, then to the
+range at 9:30 and the first signals at 9:35); the top 5 (before 9:15 rated on daily closes, from 9:15
+by opening activity: gap in the trend's direction, early volume, range so far, daily trend); market
+mood; global cues (Dow, Nasdaq, Nikkei, Hang Seng, Brent crude, USD/INR from Yahoo, can lag; a fall in
+crude or USD/INR shows green); sector heat; opening movers in your list; stocks in news (Economic
+Times markets, stocks and company RSS feeds plus Yahoo headlines for the top names, matched to your
+stocks by symbol and company name, with a rough keyword tone dot; tap a stock for its headlines); and
+ranges forming (each top stock's range so far against its normal daily move). After 9:35 the global
+cues and stocks in news stay in a folded "Market & news" section. If a news source blocks the server,
+that part says so and the rest works.
+
 ## The home page, top to bottom
 
 1. Header: refresh badge (60 s before 9:15, 30 s in market hours, off otherwise).

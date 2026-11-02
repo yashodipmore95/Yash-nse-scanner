@@ -87,7 +87,7 @@ class Analyse(unittest.TestCase):
                 (DAY, "09:25", 301.5, 302.0, 300.5, 301.8, 25000), (DAY, "09:30", 301.8, 302.4, 301.5, 302.2, 90000),
                 (DAY, "09:35", 302.3, 302.8, 302.2, 302.55, 10000)]
         r = engine.analyse("THIN", series(rows), [320.0] * 25, nifty({"09:30": 24900.0, "09:35": 24880.0}), NOW,
-                           news_flag="")
+                           news_flag="", cfg={"strict": False})
         self.assertEqual(r["kind"], "skip")
         self.assertTrue(r["reason"].startswith("Score "), r["reason"])
 
@@ -124,9 +124,45 @@ class Analyse(unittest.TestCase):
         s["o"][75] = 310.0                                            # a 3% gap up at the open
         self.assertEqual(engine.analyse("X", s, DAILY, nifty(), NOW)["reason"], "Opened with a big gap")
         down = nifty({"09:30": 24900.0, "09:35": 24880.0})
-        r = engine.analyse("X", breakout_stock(), [320.0] * 25, down, NOW, news_flag="")
-        self.assertEqual(r["kind"], "pick")                           # weak factors do not kill it
+        r = engine.analyse("X", breakout_stock(), [320.0] * 25, down, NOW, news_flag="", cfg={"strict": False})
+        self.assertEqual(r["kind"], "pick")                           # old rules: weak factors do not kill it
         self.assertEqual((r["raw_score"], r["score"]), (10, 8))
+        r = engine.analyse("X", breakout_stock(), [320.0] * 25, down, NOW, news_flag="")
+        self.assertEqual(r["reason"], "Against its daily trend (below the 20-day average)")   # Phase 1
+
+    def test_phase1_must_pass_rules(self):
+        ok = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, news_flag="")
+        self.assertEqual(ok["kind"], "pick")
+        self.assertEqual(ok["volume_ratio"], 6.0)                    # 60,000 vs 10,000 at 9:35 yesterday
+        for key in ("trend", "volume", "candle", "charges"):
+            self.assertIn(key, [k for k, _, _ in ok["checks"]])
+        # weak volume: the same breakout on yesterday-sized volume
+        weak = breakout_stock()
+        weak["v"][75 + 4] = 12000
+        r = engine.analyse("A", weak, DAILY, nifty(), NOW, news_flag="")
+        self.assertEqual(r["reason"], "Weak volume: 1.2\u00d7 normal (needs 1.5\u00d7)")
+        # long upper wick: closes just above the range high, far below its own high
+        wick = breakout_stock()
+        wick["h"][75 + 4], wick["c"][75 + 4] = 306.0, 302.7
+        r = engine.analyse("A", wick, DAILY, nifty(), NOW, news_flag="")
+        self.assertEqual(r["reason"], "Weak candle: long wick or small body")
+        # charges: a tiny target move on a cheap stock
+        r = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, news_flag="",
+                           cfg={"max_charges_share": 0.05})
+        self.assertIn("Charges would take", r["reason"])
+        # events: RBI policy at 9:45 blocks a 9:40 signal, not one an hour later
+        ev = [{"date": DAY.isoformat(), "time": "09:45", "name": "RBI policy"}]
+        r = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, news_flag="", cfg={"events": ev})
+        self.assertEqual(r["reason"], "Big event: RBI policy at 09:45")
+        ev2 = [{"date": DAY.isoformat(), "time": "11:00", "name": "RBI policy"}]
+        self.assertEqual(engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, news_flag="",
+                                        cfg={"events": ev2})["kind"], "pick")
+        self.assertIsNone(engine.event_near([{"date": DAY.isoformat(), "name": "Budget"}], NOW))
+        # 30-minute range and candle-low stop (backtest variants)
+        r = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, news_flag="", cfg={"stop_rule": "candle"})
+        self.assertEqual(r["stop"], 302.15)                           # breakout candle low 302.20 less a tick
+        r30 = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, cfg={"or_bars": 6})
+        self.assertIsNone(r30)                                        # 9:15-9:40 range not complete at 9:41
 
     def test_new_lab_fields(self):
         d = [(DAY - datetime.timedelta(days=k), 10.0 + k, 8.0, 9.0, 1) for k in range(8, 0, -1)]
@@ -200,12 +236,22 @@ class Analyse(unittest.TestCase):
                 d = PREV - datetime.timedelta(days=30 - k)
                 rows.append((d, "09:15", 300, 300 + rng / 2, 300 - rng / 2, 300, 1000000))
             return series(rows)
-        r = engine.analyse("X", breakout_stock(), DAILY, nifty(), NOW, news_flag="", daily_chart=daily_chart(5.0))
+        loose = {"strict": False}
+        r = engine.analyse("X", breakout_stock(), DAILY, nifty(), NOW, news_flag="", daily_chart=daily_chart(5.0),
+                           cfg=loose)
         self.assertEqual((r["kind"], r["range_ratio"]), ("pick", 0.7))  # 3.50 range vs 5.00 normal
-        r = engine.analyse("X", breakout_stock(), DAILY, nifty(), NOW, news_flag="", daily_chart=daily_chart(2.0))
+        r = engine.analyse("X", breakout_stock(), DAILY, nifty(), NOW, news_flag="", daily_chart=daily_chart(2.0),
+                           cfg=loose)
         self.assertIn("too wide", r["reason"])
-        r = engine.analyse("X", breakout_stock(), DAILY, nifty(), NOW, news_flag="", daily_chart=daily_chart(20.0))
+        r = engine.analyse("X", breakout_stock(), DAILY, nifty(), NOW, news_flag="", daily_chart=daily_chart(20.0),
+                           cfg=loose)
         self.assertIn("too tiny", r["reason"])
+        # Phase 1: a 5.20 day range against a 5.00 ATR has used 104% of the normal daily move
+        r = engine.analyse("X", breakout_stock(), DAILY, nifty(), NOW, news_flag="", daily_chart=daily_chart(5.0))
+        self.assertEqual((r["kind"], r["atr_used"]), ("skip", 1.04))
+        self.assertIn("Already used 104% of its normal daily move", r["reason"])
+        r = engine.analyse("X", breakout_stock(), DAILY, nifty(), NOW, news_flag="", daily_chart=daily_chart(9.0))
+        self.assertEqual((r["kind"], r["atr_used"]), ("pick", 0.58))
         rows = flat_day(PREV, 300.0)
         rows += [(DAY, "09:15", 300.5, 302.0, 299.0, 301.0, 50000), (DAY, "09:20", 301.0, 302.5, 300.0, 301.5, 30000),
                  (DAY, "09:25", 301.5, 302.0, 300.5, 301.8, 25000)]
@@ -215,7 +261,7 @@ class Analyse(unittest.TestCase):
             t += datetime.timedelta(minutes=5)
         rows.append((DAY, "13:30", 302.0, 303.2, 301.9, 303.0, 9000))
         r = engine.analyse("LATE", series(rows), [320.0] * 25, nifty(), DT.combine(DAY, datetime.time(13, 36)),
-                           news_flag="")
+                           news_flag="", cfg={"strict": False})
         self.assertIn("Afternoon: only strong signals", r["reason"])
 
     def test_sectors_breadth_and_refresh(self):
@@ -307,6 +353,73 @@ class Analyse(unittest.TestCase):
         old = xml.replace("29 Oct", "20 Oct")
         self.assertEqual(engine.news_flag(old, NOW), "")
         self.assertIsNone(engine.news_flag("<html", NOW))
+
+
+class ScreenV2(unittest.TestCase):
+    def near_rows(self, last=302.2):
+        rows = flat_day(PREV, 300.0)
+        rows += [(DAY, "09:15", 300.5, 302.0, 299.0, 301.0, 50000), (DAY, "09:20", 301.0, 302.5, 300.0, 301.5, 30000),
+                 (DAY, "09:25", 301.5, 302.0, 300.5, 301.8, 25000), (DAY, "09:30", 301.8, 302.4, 301.5, last, 20000)]
+        return series(rows)
+
+    def test_watch_info(self):
+        now = DT.combine(DAY, datetime.time(9, 36))
+        w = engine.watch_info("NEAR", self.near_rows(), DAILY, nifty(), now)
+        self.assertEqual((w["entry"], w["stop"], w["target"]), (302.55, 300.75, 306.15))
+        self.assertEqual(w["to_go"], 0.35)
+        self.assertGreaterEqual(w["rating"], 5)                      # trend 2 + rising 1 + in play 2 + ...
+        self.assertEqual(w["checks"]["trend"], True)
+        self.assertIsNone(engine.watch_info("NEAR", self.near_rows(), [320.0] * 25, nifty(), now))  # against trend
+        self.assertIsNone(engine.watch_info("FAR", self.near_rows(290.0), DAILY, nifty(), now))     # >2% away
+        self.assertIsNone(engine.watch_info("A", breakout_stock(), DAILY, nifty(), NOW))            # broke out
+
+    def test_bar_state_and_freshness(self):
+        self.assertEqual(engine.bar_state(300.0, 302.55, 1.8), "green")
+        self.assertEqual(engine.bar_state(302.8, 302.55, 1.8), "amber")      # +0.14x risk
+        self.assertEqual(engine.bar_state(303.1, 302.55, 1.8), "orange")     # +0.31x
+        self.assertEqual(engine.bar_state(303.4, 302.55, 1.8), "red")        # +0.47x
+        pick = engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW, news_flag="")   # entry 304, risk 3.25
+        st, d = engine.freshness(pick, 304.5, DT.combine(DAY, datetime.time(9, 45)))
+        self.assertEqual((st, d["chase_limit"]), ("fresh", 304.65))
+        st, d = engine.freshness(pick, 304.9, DT.combine(DAY, datetime.time(9, 50)))
+        self.assertEqual((st, d["rr_now"]), ("late", 1.35))
+        self.assertEqual(engine.freshness(pick, 306.0, DT.combine(DAY, datetime.time(9, 50)))[0], "missed")
+        self.assertEqual(engine.freshness(pick, 304.2, DT.combine(DAY, datetime.time(10, 20)))[0], "missed")
+
+    def test_premarket_and_mood(self):
+        self.assertEqual(engine.premarket_rating([100 + k * 0.5 for k in range(40)]), 8)   # RSI 100 > 70
+        self.assertIsNone(engine.premarket_rating([1.0] * 10))
+        self.assertEqual(engine.market_mood((14.0, 0), 120, 50, 0.4), ("good", 3))
+        self.assertEqual(engine.market_mood((20.0, 0), 50, 120, -0.5)[0], "weak")
+        self.assertEqual(engine.market_mood(None, 0, 0, 0.0)[0], "mixed")
+
+
+class OpeningView(unittest.TestCase):
+    def test_tone_and_news_matching(self):
+        self.assertEqual(engine.tone("Acme Auto bags Rs 500 crore order, shares jump"), "good")
+        self.assertEqual(engine.tone("SEBI probe into Acme Bank; stock falls"), "bad")
+        self.assertEqual(engine.tone("Acme Tech to hold board meeting"), "neutral")
+        xml = ("<rss><channel><item><title>Acme Auto bags big order</title><link>u1</link>"
+               "<pubDate>Thu, 29 Oct 2026 03:00:00 +0000</pubDate></item>"
+               "<item><title>Old story about Acme Auto</title><pubDate>Mon, 19 Oct 2026 03:00:00 +0000</pubDate>"
+               "</item><item><title>Markets open higher; ACMEBANK leads</title>"
+               "<pubDate>Thu, 29 Oct 2026 03:30:00 +0000</pubDate></item></channel></rss>")
+        items = engine.rss_items(xml, "ET Markets", NOW)
+        self.assertEqual([i["title"][:10] for i in items], ["Markets op", "Acme Auto "])   # old one dropped
+        m = engine.match_news(items, {"ACMEAUTO": "Acme Auto Limited", "ACMEBANK": "Acme Bank Limited"},
+                              ["ACMEAUTO", "ACMEBANK", "XYZ"])
+        self.assertEqual(sorted(m), ["ACMEAUTO", "ACMEBANK"])
+        self.assertEqual(m["ACMEAUTO"][0]["tone"], "good")
+        self.assertEqual(engine.rss_items("<html>", "x"), [])
+
+    def test_opening_rating_and_movers(self):
+        r = engine.opening_rating("A", breakout_stock(), DAILY, nifty(), DT.combine(DAY, datetime.time(9, 31)))
+        self.assertEqual((r["trend"], r["minutes"]), (True, 15))          # 9:15, 9:20, 9:25 complete by 9:31
+        self.assertGreaterEqual(r["rating"], 6)
+        self.assertEqual(r["gap"], 0.17)                                   # opened 300.50 vs 300.00
+        up, down = engine.movers({"A": series([(PREV, "09:15", 0, 0, 0, 300.0, 0)])}, {"A": breakout_stock()},
+                                 DAY, NOW)
+        self.assertEqual((up, down), ([("A", 1.33)], []))
 
 
 class Trades(unittest.TestCase):

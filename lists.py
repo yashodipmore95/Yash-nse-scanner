@@ -101,3 +101,35 @@ def universe():
         return [], note
     with open(path, encoding="utf-8") as fh:
         return [ln.split("|", 1)[0].strip() for ln in fh if ln.strip()], ""
+
+
+def load_names(fname):
+    """{SYMBOL: company name} from a list file (Company Name column, or fo_mktlots.csv's UNDERLYING)."""
+    local = os.path.join(LISTS, fname)
+    text = ""
+    if os.path.exists(local):
+        with open(local, encoding="utf-8-sig", errors="replace") as fh:
+            text = fh.read()
+    else:
+        urls = [FNO_URL] if fname == "fo_mktlots.csv" else [u % fname for u in INDEX_URLS]
+        for url in urls:
+            try:
+                text = fetch(url)
+                break
+            except Exception:
+                continue
+    rows = list(csv.reader(io.StringIO((text or "").lstrip("\ufeff"))))
+    for i, r in enumerate(rows[:5]):
+        cells = [c.strip().upper() for c in r]
+        if "SYMBOL" in cells:
+            si = cells.index("SYMBOL")
+            ni = cells.index("COMPANY NAME") if "COMPANY NAME" in cells else \
+                cells.index("UNDERLYING") if "UNDERLYING" in cells else None
+            if ni is None:
+                return {}
+            out = {}
+            for row in rows[i + 1:]:
+                if len(row) > max(si, ni) and row[si].strip() and row[si].strip().upper() != "SYMBOL":
+                    out[row[si].strip().upper()] = row[ni].strip().title()
+            return out
+    return {}

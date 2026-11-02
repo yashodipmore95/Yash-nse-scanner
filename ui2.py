@@ -470,3 +470,131 @@ def slippage_dots(values, avg):
             'y1="3" x2="160" y2="27" stroke="currentColor"/>%s<text x="160" y="30" text-anchor="middle" font-size="8" '
             'fill="currentColor" opacity=".7">signal price &middot; right = paid more</text></svg></div>'
             % ("g" if avg <= 0 else "a", "+" if avg > 0 else "", avg, dots))
+
+
+# ---------------------------------------------------------------- opening view
+
+def opening_countdown(now, phase):
+    """Ring + bar: to 9:15 (before the open) or to 9:30 / 9:35 (range forming)."""
+    day = now.date()
+    if phase == "pre":
+        end, start = datetime.datetime.combine(day, datetime.time(9, 15)), datetime.datetime.combine(day,
+                                                                                                    datetime.time(9, 0))
+        title, sub = "Market opens soon", "Opens 9:15 &middot; range ready 9:30 &middot; first signals 9:35"
+    else:
+        end, start = datetime.datetime.combine(day, datetime.time(9, 30)), datetime.datetime.combine(day,
+                                                                                                    datetime.time(9, 15))
+        if now >= end:
+            end, start = datetime.datetime.combine(day, datetime.time(9, 35)), end
+            title = "Range ready, first candle closing"
+        else:
+            title = "Opening range forming"
+        sub = "Range ready 9:30 &middot; first signals 9:35"
+    left = max(0, int((end - now).total_seconds()))
+    frac = 1 - min(1.0, left / max(1.0, (end - start).total_seconds()))
+    c = 2 * 3.14159 * 16
+    return ('<div class="v2c v2row"><svg viewBox="0 0 40 40" width="46" height="46"><circle cx="20" cy="20" r="16" '
+            'fill="none" stroke="%s" stroke-width="5"/><circle cx="20" cy="20" r="16" fill="none" stroke="%s" '
+            'stroke-width="5" stroke-dasharray="%.1f %.1f" transform="rotate(-90 20 20)"/><text x="20" y="24" '
+            'text-anchor="middle" font-size="10" font-weight="600" fill="currentColor">%d:%02d</text></svg>'
+            '<div style="flex:1"><b style="font-size:13px">%s</b><div class="v2mut">%s</div><div style="height:6px;'
+            'border-radius:3px;background:%s;margin-top:4px;overflow:hidden"><div style="width:%d%%;height:100%%;'
+            'background:%s"></div></div></div></div>'
+            % (GREY, AMBER, c * frac, c, left // 60, left % 60, title, sub, GREY, int(frac * 100), AMBER))
+
+
+def global_cues(cues):
+    if not cues:
+        return '<div class="v2mut">Global cues unavailable right now.</div>'
+    cells = []
+    for name, last, chg in cues:
+        good = chg >= 0 if name not in ("Crude", "USD/INR") else chg <= 0     # cheaper oil / stronger rupee help India
+        cls = ("var(--bg-g)", "var(--g)") if good else ("var(--bg-r)", "var(--r)")
+        cells.append('<div style="border-radius:8px;padding:5px 2px;text-align:center;font-size:10px;background:%s;'
+                     'color:%s"><b>%s</b><br>%+.1f%%</div>' % (cls[0], cls[1], esc(name), chg))
+    return ('<div class="v2sec">&#127757; Global cues</div><div style="display:grid;grid-template-columns:repeat(3,'
+            'minmax(0,1fr));gap:4px">%s</div><div class="v2mut" style="font-size:9px">Green = good for Indian stocks '
+            '(for crude and USD/INR, a fall is green)</div>' % "".join(cells))
+
+
+def sector_heat(sectors, label="Sector heat"):
+    if not sectors:
+        return ""
+    cells = []
+    for name, chg in sorted(sectors.items(), key=lambda kv: -kv[1]):
+        a = min(abs(chg) / 1.5, 1.0)
+        bg = ("rgba(46,158,79,%.2f)" % (0.18 + 0.7 * a)) if chg > 0.05 else \
+            ("rgba(214,69,69,%.2f)" % (0.18 + 0.7 * a)) if chg < -0.05 else GREY
+        cells.append('<div style="background:%s;border-radius:6px;padding:5px 1px;text-align:center;font-size:10px">'
+                     '<b>%s</b><br>%+.1f%%</div>' % (bg, esc(name), chg))
+    return ('<div class="v2sec">&#127981; %s</div><div style="display:grid;grid-template-columns:repeat(4,'
+            'minmax(0,1fr));gap:4px">%s</div>' % (esc(label), "".join(cells)))
+
+
+def movers_bars(up, down):
+    if not up and not down:
+        return ""
+    top = max([abs(c) for _, c in up + down] + [0.5])
+    rows = []
+    for sym, chg in up + down:
+        w = int(100 * abs(chg) / top)
+        bar = ('<div style="width:%d%%;height:8px;border-radius:4px;background:%s"></div>' % (w, GREEN if chg > 0 else RED))
+        rows.append('<div class="v2row" style="font-size:11px;margin:3px 0"><span style="width:96px">%s</span>'
+                    '<div style="flex:1;display:flex;justify-content:%s">%s</div><span style="width:48px;'
+                    'text-align:right;color:var(--%s)">%+.1f%%</span></div>'
+                    % (esc(sym), "flex-start" if chg > 0 else "flex-end", bar, "g" if chg > 0 else "r", chg))
+    return '<div class="v2sec">&#128640; Opening movers (your list)</div><div class="v2c">%s</div>' % "".join(rows)
+
+
+TONE_COL = {"good": GREEN, "bad": RED, "neutral": "#888780"}
+
+
+def news_chips(by_sym):
+    if not by_sym:
+        return ('<div class="v2sec">&#128240; Stocks in news</div><div class="v2mut">No headlines about your stocks '
+                'yet today.</div>')
+    chips = []
+    for sym, items in sorted(by_sym.items(), key=lambda kv: -len(kv[1]))[:10]:
+        tones = [i["tone"] for i in items]
+        t = "good" if tones.count("good") > tones.count("bad") else "bad" if tones.count("bad") > tones.count("good") \
+            else "neutral"
+        chips.append('<span class="v2chip" style="padding-left:7px"><span style="display:inline-block;width:8px;'
+                     'height:8px;border-radius:50%%;background:%s;margin-right:3px"></span>%s &middot; %d</span>'
+                     % (TONE_COL[t], esc(sym), len(items)))
+    return '<div class="v2sec">&#128240; Stocks in news</div><div class="v2c" style="padding:6px 8px">%s</div>' % \
+        "".join(chips)
+
+
+def news_detail(sym, items):
+    rows = []
+    for it in items[:5]:
+        when = engine.hhmm(engine.scan.to_ist(it["time"]).time()) if it.get("time") else ""
+        link = (' <a href="%s" target="_blank">&#8599;</a>' % esc(it["link"])) if it.get("link") else ""
+        rows.append('<div style="margin-top:5px;font-size:12px"><span style="display:inline-block;width:8px;height:8px;'
+                    'border-radius:50%%;background:%s;margin-right:4px"></span>%s%s</div><div class="v2mut" '
+                    'style="margin-left:12px">%s &middot; %s</div>'
+                    % (TONE_COL[it["tone"]], esc(it["title"]), link, when, esc(it["source"])))
+    return '<div class="v2c" style="border:1.5px solid var(--b)"><b>%s</b>%s<div class="v2mut" style="margin-top:4px">' \
+           'Tone dots are a rough keyword guess: read the headline.</div></div>' % (esc(sym), "".join(rows))
+
+
+def ranges_forming(items):
+    rows = []
+    for o in items:
+        rr = o.get("range_ratio")
+        if rr is None:
+            continue
+        w = min(100, int(100 * rr / 1.2))
+        col = BLUE if 0.25 <= rr <= 0.8 else AMBER if rr < 0.25 else RED
+        note = "tight" if rr < 0.4 else "ok" if rr <= 0.8 else "too wide" if rr > 1.2 else "wide"
+        rows.append('<div class="v2row" style="font-size:11px;margin:3px 0"><span style="width:96px">%s</span>'
+                    '<svg viewBox="0 0 120 14" width="120" height="14"><rect x="0" y="4" width="120" height="6" rx="3" '
+                    'fill="%s"/><rect x="0" y="4" width="%d" height="6" rx="3" fill="%s"/><line x1="50" y1="0" x2="50" '
+                    'y2="14" stroke="currentColor" stroke-opacity=".5" stroke-dasharray="2 2"/></svg>'
+                    '<span class="v2mut" style="width:80px;text-align:right">%.2f&times; &middot; %s</span></div>'
+                    % (esc(o["symbol"]), GREY, int(1.2 * w), col, rr, note))
+    if not rows:
+        return ""
+    return ('<div class="v2sec">&#9203; Ranges forming</div><div class="v2c">%s<div class="v2mut" style="margin-top:4px">'
+            'Opening range so far vs the stock\'s normal daily move (ATR). Dashed line = 0.5&times;. Blue = tradable '
+            'size.</div></div>' % "".join(rows))

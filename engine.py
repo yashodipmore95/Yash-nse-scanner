@@ -1209,3 +1209,145 @@ def market_mood(vix, up, down, nifty_chg):
     if vix:
         score += -1 if vix[0] > 18 else 1 if vix[0] < 15 else 0
     return ("good" if score >= 1 else "weak" if score <= -1 else "mixed"), score
+
+
+# ---------------------------------------------------------------- opening view (before 9:35): cues, movers, news
+
+GLOBAL = [("Dow", "^DJI"), ("Nasdaq", "^IXIC"), ("Nikkei", "^N225"), ("Hang Seng", "^HSI"), ("Crude", "BZ=F"),
+          ("USD/INR", "INR=X")]
+NEWS_FEEDS = [("ET Markets", "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
+              ("ET Stocks", "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"),
+              ("ET Companies", "https://economictimes.indiatimes.com/news/company/rssfeeds/2143429.cms")]
+GOOD_WORDS = re.compile(r"\b(upgrade[sd]?|order win|wins order|bags|bagged|jumps?|surges?|soars?|rall(y|ies)|"
+                        r"record high|beats?|strong|raises? target|target raised|buy rating|outperform|approval|"
+                        r"profit (rises|jumps|up)|dividend|bonus|buyback|expands?|acquires?)\b", re.I)
+BAD_WORDS = re.compile(r"\b(downgrade[sd]?|falls?|slumps?|plunges?|tanks?|crash(es)?|probe|raid|fraud|penalty|"
+                       r"fine[sd]?|default|miss(es)?|weak|loss widens|profit (falls|drops|down)|sell rating|"
+                       r"underperform|resigns?|ban(s|ned)?|recall|lawsuit|insolvency|block deal)\b", re.I)
+
+
+def fetch_global():
+    """[(name, last, % change)] for the global cues (Yahoo; futures and FX can lag)."""
+    import urllib.parse
+    path = "/v7/finance/spark?symbols=%s&range=1d&interval=5m" % ",".join(
+        urllib.parse.quote(y, safe="^=.-") for _, y in GLOBAL)
+    data = scan.parse_spark(scan.yahoo_get(path), {y.upper(): y for _, y in GLOBAL})
+    out = []
+    for name, y in GLOBAL:
+        m = (data.get(y) or {}).get("meta") or {}
+        price, prev = m.get("regularMarketPrice"), m.get("chartPreviousClose") or m.get("previousClose")
+        if price and prev:
+            out.append((name, round(float(price), 2), round((float(price) / float(prev) - 1) * 100, 2)))
+    return out
+
+
+def tone(title):
+    """'good' | 'bad' | 'neutral' from simple keywords. A rough guide: read the headline."""
+    g, b = bool(GOOD_WORDS.search(title or "")), bool(BAD_WORDS.search(title or ""))
+    return "good" if g and not b else "bad" if b and not g else "neutral"
+
+
+def rss_items(xml_text, source, now=None, hours=24):
+    """[{title, link, time (naive UTC or None), source, tone}] from an RSS feed, newest first."""
+    import email.utils
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    cutoff = (scan.ist_to_utc(now) - datetime.timedelta(hours=hours)) if now else None
+    out = []
+    for it in root.iter("item"):
+        title = re.sub(r"\s+", " ", (it.findtext("title") or "")).strip()
+        if not title:
+            continue
+        when = None
+        try:
+            d = email.utils.parsedate_to_datetime(it.findtext("pubDate") or "")
+            when = d.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        except (TypeError, ValueError):
+            pass
+        if cutoff and when and when < cutoff:
+            continue
+        out.append({"title": title, "link": (it.findtext("link") or "").strip(), "time": when, "source": source,
+                    "tone": tone(title)})
+    out.sort(key=lambda x: x["time"] or datetime.datetime(1970, 1, 1), reverse=True)
+    return out
+
+
+def _name_keys(name):
+    words = re.sub(r"[^A-Za-z0-9& ]", " ", name or "").split()
+    words = [w for w in words if w.lower() not in ("limited", "ltd", "the", "india", "industries", "company",
+                                                   "corporation", "co", "of", "and")]
+    keys = []
+    if words:
+        keys.append(" ".join(words[:2]) if len(words) >= 2 else words[0])
+        if len(words[0]) >= 5:
+            keys.append(words[0])
+    return [k for k in keys if len(k) >= 4]
+
+
+def match_news(items, names, symbols):
+    """{symbol: [items]} for headlines that name a stock (its symbol, or its company name)."""
+    pats = {}
+    for sym in symbols:
+        alts = [re.escape(sym)] if len(sym) >= 3 else []
+        alts += [re.escape(k) for k in _name_keys(names.get(sym, ""))]
+        if alts:
+            pats[sym] = re.compile(r"(?<![A-Za-z0-9])(%s)(?![A-Za-z0-9])" % "|".join(alts), re.I)
+    out = {}
+    for it in items:
+        for sym, rx in pats.items():
+            if rx.search(it["title"]):
+                out.setdefault(sym, [])
+                if all(x["title"] != it["title"] for x in out[sym]):
+                    out[sym].append(it)
+    return out
+
+
+def opening_rating(sym, series, daily, nifty, now, daily_chart=None):
+    """Before the range is ready: a 0-10 rating from opening activity. With the daily trend 3, 20-day average
+    rising 1, a gap of 0.3 to 2.5% in the trend's direction 2, in play so far 2 (1.5x) / 1 (1.2x), range so
+    far 0.25 to 0.8x the ATR 1, stronger than Nifty since the open 1."""
+    day = now.date()
+    bars = day_bars(series, day, now)
+    if not bars:
+        return None
+    _, ybars = previous_day(series, day)
+    prev = ybars[-1]["c"] if ybars else None
+    if not prev:
+        return None
+    gap = pct(bars[0]["o"], prev)
+    chg = pct(bars[-1]["c"], prev)
+    avg20 = sma(daily or [])
+    trend = bool(avg20) and prev > avg20
+    rv = relative_volume(series, day, bars[-1]["start"])
+    rows = daily_ohlc(daily_chart, day) if daily_chart else []
+    a14 = atr(rows)
+    hi, lo = max(b["h"] for b in bars), min(b["l"] for b in bars)
+    rr = (hi - lo) / a14 if a14 else None
+    nb = day_bars(nifty or {}, day, now)
+    _, nyb = previous_day(nifty or {}, day)
+    n_chg = pct(nb[-1]["c"], nyb[-1]["c"]) if (nb and nyb) else None
+    pts = 3 if trend else 0
+    pts += 1 if sma_rising(daily or []) else 0
+    pts += 2 if (gap is not None and 0.3 <= gap <= 2.5 and trend) else 0
+    pts += 2 if rv and rv >= 1.5 else 1 if rv and rv >= 1.2 else 0
+    pts += 1 if (rr is not None and 0.25 <= rr <= 0.8) else 0
+    pts += 1 if (chg is not None and n_chg is not None and chg > n_chg) else 0
+    return {"symbol": sym, "rating": pts, "gap": round(gap, 2) if gap is not None else None,
+            "chg": round(chg, 2) if chg is not None else None, "rvol": round(rv, 1) if rv else None,
+            "range_ratio": round(rr, 2) if rr is not None else None, "trend": trend,
+            "minutes": len(bars) * 5}
+
+
+def movers(daily, spark, day, now, n=4):
+    """(gainers, losers): [(symbol, % change since yesterday's close)] from the cheap first-pass data."""
+    moves = []
+    for sym, s5 in spark.items():
+        bars = day_bars(s5, day, now)
+        prev = closes_before(daily.get(sym) or {}, day)
+        if bars and prev:
+            moves.append((sym, round((bars[-1]["c"] / prev[-1] - 1) * 100, 2)))
+    moves.sort(key=lambda t: -t[1])
+    return [m for m in moves[:n] if m[1] > 0], [m for m in sorted(moves, key=lambda t: t[1])[:n] if m[1] < 0]

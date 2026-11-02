@@ -245,6 +245,43 @@ def vix(key):
         return None
 
 
+@st.cache_data(ttl=240, show_spinner=False)
+def global_cues(key):
+    try:
+        return engine.fetch_global()
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def market_news(slot):
+    items = []
+    for name, url in engine.NEWS_FEEDS:
+        try:
+            items += engine.rss_items(lists.fetch(url), name, engine.now_ist())
+        except Exception:
+            continue
+    return items
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def stock_headlines(sym, slot):
+    try:
+        return engine.rss_items(engine.fetch_news(sym), "Yahoo Finance", engine.now_ist())
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def names_map(source, day):
+    fname = lists.PRESETS.get(source, "ind_nifty500list.csv")
+    names = lists.load_names(fname)
+    if fname != "ind_nifty500list.csv":
+        for k, v in lists.load_names("ind_nifty500list.csv").items():
+            names.setdefault(k, v)
+    return names
+
+
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def industry_map(day):
     rows, _ = lists.load_preset("ind_nifty500list.csv")
@@ -444,11 +481,15 @@ def header(now, clock=True):
          '<span class="v1pill" style="border:1px solid var(--line)">&#8377;%g&ndash;%g</span>'
          % ("Practice mode" if mode == "paper" else "Real money", engine.rupees(capital),
             engine.rupees(max_loss), min_price, max_price))
+
+
+def journal_note():
     if st.session_state.get("journal_error"):
-        st.warning("Journal not saved to GitHub: %s" % st.session_state["journal_error"])
-    elif not store():
-        st.caption("Trades are kept only while this page is open (no GITHUB_TOKEN / JOURNAL_REPO in Secrets). "
-                   "Use the download button at the bottom to keep them.")
+        return "Journal not saved to GitHub: %s" % st.session_state["journal_error"]
+    if not store():
+        return ("Journal not set up: trades are kept only while this page is open. See README, \"Keep your trades "
+                "safe\" (GITHUB_TOKEN and JOURNAL_REPO in Secrets).")
+    return None
 
 
 def schedule_message(now, phase, msg):
@@ -500,6 +541,106 @@ def premarket_top(day):
     return [(s_, r, "setup") for r, s_ in rated[:5]]
 
 
+def news_section(symbols, top_syms, now, with_details=True):
+    """Stocks in news: market headlines matched to your stocks, plus Yahoo headlines for the top names."""
+    slot = now.strftime("%Y%m%d%H") + str(now.minute // 15)
+    names = names_map(source, now.date().isoformat())
+    by_sym = engine.match_news(market_news(slot), names, symbols)
+    for s_ in top_syms[:5]:
+        for it in stock_headlines(s_, now.strftime("%Y%m%d%H")):
+            lst = by_sym.setdefault(s_, [])
+            if all(x["title"] != it["title"] for x in lst):
+                lst.append(it)
+    by_sym = {k: v for k, v in by_sym.items() if v}
+    html(ui2.news_chips(by_sym))
+    if not with_details:
+        return
+    open_n = st.session_state.get("open_news")
+    for sym, items in sorted(by_sym.items(), key=lambda kv: -len(kv[1]))[:10]:
+        is_open = sym == open_n
+        if st.button(("\u25b4 Hide %s news" if is_open else "\U0001F4F0 %s news") % sym, key="news" + sym):
+            st.session_state["open_news"] = None if is_open else sym
+            st.rerun()
+        if is_open:
+            html(ui2.news_detail(sym, items))
+
+
+def opening_scan(now, day, key):
+    """9:15-9:35: breadth, movers and an opening-activity rating for the most active stocks."""
+    out = {"up": 0, "down": 0, "gainers": [], "losers": [], "rated": [], "symbols": []}
+    syms, _ = symbols_for(source, typed, day.isoformat())
+    if not syms:
+        return out
+    daily, _ = daily_data(tuple(syms), day.isoformat())
+    inrange = []
+    for s_ in syms:
+        m = (daily.get(s_) or {}).get("meta") or {}
+        p = m.get("regularMarketPrice")
+        if p and min_price <= p <= max_price:
+            inrange.append((-(p * (m.get("regularMarketVolume") or 0)), s_))
+    inrange = [s_ for _, s_ in sorted(inrange)][:250]
+    out["symbols"] = inrange
+    spark, _ = spark_5m(tuple(inrange), key) if inrange else ({}, {})
+    out["up"], out["down"] = engine.breadth(daily, spark, day, now)
+    out["gainers"], out["losers"] = engine.movers(daily, spark, day, now)
+    pre = []
+    for s_ in inrange:
+        closes = engine.closes_before(daily.get(s_) or {}, day)
+        bars = engine.day_bars(spark.get(s_) or {}, day, now)
+        if len(closes) < 20 or not bars:
+            continue
+        avg = sum(closes[-20:]) / 20.0
+        chg = (bars[-1]["c"] / closes[-1] - 1) * 100
+        pre.append(((closes[-1] > avg) * 2 + (0.2 <= chg <= 2.5), abs(chg), s_))
+    pre.sort(key=lambda t: (-t[0], -t[1]))
+    nifty = chart(engine.NIFTY, key)
+    for _, _, s_ in pre[:15]:
+        series = chart(s_, key)
+        if not series:
+            continue
+        r = engine.opening_rating(s_, series, engine.closes_before(daily.get(s_) or {}, day), nifty, now,
+                                  daily_chart(s_, day.isoformat()))
+        if r:
+            out["rated"].append(r)
+    out["rated"].sort(key=lambda r: (-r["rating"], -(r["rvol"] or 0)))
+    out["nifty"] = nifty
+    return out
+
+
+def opening_view(now, day, key, phase, status):
+    """Before 9:35 (and on closed days): countdown, top 5, mood, global cues, sectors, movers, news, ranges."""
+    if phase in ("pre", "forming"):
+        html(ui2.opening_countdown(now, phase))
+    sect = sectors(key)
+    v = vix(key)
+    if phase == "forming":
+        with st.spinner("Reading the open..."):
+            op = opening_scan(now, day, key)
+        top = [(r["symbol"], r["rating"], "setup") for r in op["rated"]]
+        show_top5(top)
+        html('<div class="v2mut">Top 5 by opening activity (gap, early volume, range, trend).</div>')
+        n_today = engine.day_bars(op.get("nifty") or {}, day, now)
+        _, nyb = engine.previous_day(op.get("nifty") or {}, day)
+        n_chg = engine.pct(n_today[-1]["c"], nyb[-1]["c"]) if (n_today and nyb) else None
+        label, score = engine.market_mood(v, op["up"], op["down"], n_chg)
+        html(ui2.mood(label, score, v, op["up"], op["down"], n_chg, {}))
+        html(ui2.global_cues(global_cues(key)))
+        html(ui2.sector_heat(sect))
+        html(ui2.movers_bars(op["gainers"], op["losers"]))
+        news_section(op["symbols"], [r["symbol"] for r in op["rated"]], now)
+        html(ui2.ranges_forming(op["rated"][:8]))
+    else:
+        pre_top = premarket_top(day)
+        show_top5(pre_top)
+        html('<div class="v2mut">Pre-market top 5, rated on daily closes. The live view starts at 9:15 AM.</div>')
+        label, score = engine.market_mood(v, 0, 0, None)
+        html(ui2.mood(label, score, v, 0, 0, None, {}))
+        html(ui2.global_cues(global_cues(key)))
+        html(ui2.sector_heat(sect, "Sectors (last session)"))
+        syms, _ = symbols_for(source, typed, day.isoformat())
+        news_section(syms or [], [s_ for s_, _, _ in pre_top], now)
+
+
 def show_top5(items):
     prev = st.session_state.get("top5_prev", [])
     html(ui2.top5(items, prev))
@@ -532,9 +673,7 @@ def page():
     done, why, counts = journal.guard(data, mode, day, CFG)
 
     if phase in ("closed", "pre", "forming"):
-        # 2 top 5 (pre-market rating); the rest of the page waits for the opening range
-        show_top5(premarket_top(day))
-        html('<div class="v2mut">Pre-market top 5, rated on daily closes. The live watchlist starts at 9:30 AM.</div>')
+        opening_view(now, day, key, phase, status)
         res = None
     else:
         with st.spinner("Updating..."):
@@ -638,11 +777,18 @@ def page():
                 html(ui.finished_rows(res["finished"]))
         with st.expander("Skipped right now: %d" % len(res["skipped"])):
             html(ui.skipped_rows(res["skipped"]) or '<span class="v1mut">None yet.</span>')
+        with st.expander("Market & news"):
+            html(ui2.global_cues(global_cues(key)))
+            news_section([w["symbol"] for w in res.get("watch_items", [])] + [r["symbol"] for r in res["picks"]] +
+                         [r["symbol"] for r in res["finished"]], [s_ for s_, _, _ in top], now, with_details=False)
 
     # 8 bottom
     html(ui2.LEGEND)
     for msg in status:
         st.info(msg)
+    jn = journal_note()
+    if jn:
+        st.warning(jn)
     if res:
         st.caption("Scanned %d stocks priced \u20b9%g\u2013%g from %s; %d had a full check."
                    % (res["scanned"], min_price, max_price, source, res["checked"]))
