@@ -188,7 +188,7 @@ class Analyse(unittest.TestCase):
         self.assertEqual(engine.vix_mood(21.0)[0], "high")
         names = [row[0] for row in journal.lab_stats(journal.empty())]
         self.assertIn("Yesterday was NR7 (narrowest of 7 days)", names)
-        self.assertEqual(len(names), 8)
+        self.assertEqual(len(names), 9)
 
     def test_vwap_must_pass(self):
         rows = flat_day(PREV, 300.0)
@@ -372,6 +372,23 @@ class ScreenV2(unittest.TestCase):
         self.assertIsNone(engine.watch_info("NEAR", self.near_rows(), [320.0] * 25, nifty(), now))  # against trend
         self.assertIsNone(engine.watch_info("FAR", self.near_rows(290.0), DAILY, nifty(), now))     # >2% away
         self.assertIsNone(engine.watch_info("A", breakout_stock(), DAILY, nifty(), NOW))            # broke out
+
+    def test_touched_and_fell_back(self):
+        rows = flat_day(PREV, 300.0)
+        rows += [(DAY, "09:15", 300.5, 302.0, 299.0, 301.0, 50000), (DAY, "09:20", 301.0, 302.5, 300.0, 301.5, 30000),
+                 (DAY, "09:25", 301.5, 302.0, 300.5, 301.8, 25000),
+                 (DAY, "09:30", 301.8, 302.9, 301.5, 302.1, 20000),   # wick to 302.90 past the 302.55 buy price
+                 (DAY, "09:35", 302.1, 302.3, 301.9, 302.2, 20000)]
+        now = DT.combine(DAY, datetime.time(9, 41))
+        plain = engine.watch_info("NEAR", self.near_rows(), DAILY, nifty(), DT.combine(DAY, datetime.time(9, 36)))
+        w = engine.watch_info("NEAR", series(rows), DAILY, nifty(), now)
+        self.assertEqual(w["touched_at"].time(), datetime.time(9, 35))
+        self.assertLess(w["rating"], plain["rating"] + 1)              # lowered by 2 (other factors may differ)
+        # a later real breakout records the failed touch in the filter lab
+        rows2 = rows + [(DAY, "09:40", 302.2, 304.2, 302.1, 304.0, 90000)]
+        r = engine.analyse("NEAR", series(rows2), DAILY, nifty(), DT.combine(DAY, datetime.time(9, 46)), news_flag="")
+        self.assertTrue(r["lab"]["failed_touch"])
+        self.assertFalse(engine.analyse("A", breakout_stock(), DAILY, nifty(), NOW)["lab"]["failed_touch"])
 
     def test_bar_state_and_freshness(self):
         self.assertEqual(engine.bar_state(300.0, 302.55, 1.8), "green")

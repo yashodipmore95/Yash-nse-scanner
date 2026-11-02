@@ -67,6 +67,15 @@ class Manage(unittest.TestCase):
         legs, _ = self.run_it([(304, 313, 303.9, 312.5, 1000), (312, 312.2, 307, 307.5, 2000000)], "vwap_trail")
         self.assertEqual(legs[0][2], "VWAP trail")                  # no 2x target in this mode
 
+    def test_gross_and_charges_in_the_summary(self):
+        legs = [(1.0, 312.0, "target")]
+        self.assertEqual(backtest.gross_of("buy", 10, ENTRY, legs), 80.0)
+        t = {"net": backtest.settle("buy", 10, ENTRY, legs), "gross": 80.0, "date": "2026-10-29", "time": "09:40"}
+        sm = backtest.summary([t])
+        self.assertEqual(sm["gross_total"], 80.0)
+        self.assertAlmostEqual(sm["charges_total"], 80.0 - t["net"], places=2)
+        self.assertGreater(sm["charges_total"], 10)
+
     def test_charges_match_the_engine(self):
         self.assertAlmostEqual(backtest.charges_legs("buy", 7, 685, [(7, 693)]), engine.charges(7, 685, 693), places=2)
 
