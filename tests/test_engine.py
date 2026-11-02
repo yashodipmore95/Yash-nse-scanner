@@ -394,6 +394,34 @@ class ScreenV2(unittest.TestCase):
         self.assertEqual(engine.market_mood(None, 0, 0, 0.0)[0], "mixed")
 
 
+class OpeningView(unittest.TestCase):
+    def test_tone_and_news_matching(self):
+        self.assertEqual(engine.tone("Acme Auto bags Rs 500 crore order, shares jump"), "good")
+        self.assertEqual(engine.tone("SEBI probe into Acme Bank; stock falls"), "bad")
+        self.assertEqual(engine.tone("Acme Tech to hold board meeting"), "neutral")
+        xml = ("<rss><channel><item><title>Acme Auto bags big order</title><link>u1</link>"
+               "<pubDate>Thu, 29 Oct 2026 03:00:00 +0000</pubDate></item>"
+               "<item><title>Old story about Acme Auto</title><pubDate>Mon, 19 Oct 2026 03:00:00 +0000</pubDate>"
+               "</item><item><title>Markets open higher; ACMEBANK leads</title>"
+               "<pubDate>Thu, 29 Oct 2026 03:30:00 +0000</pubDate></item></channel></rss>")
+        items = engine.rss_items(xml, "ET Markets", NOW)
+        self.assertEqual([i["title"][:10] for i in items], ["Markets op", "Acme Auto "])   # old one dropped
+        m = engine.match_news(items, {"ACMEAUTO": "Acme Auto Limited", "ACMEBANK": "Acme Bank Limited"},
+                              ["ACMEAUTO", "ACMEBANK", "XYZ"])
+        self.assertEqual(sorted(m), ["ACMEAUTO", "ACMEBANK"])
+        self.assertEqual(m["ACMEAUTO"][0]["tone"], "good")
+        self.assertEqual(engine.rss_items("<html>", "x"), [])
+
+    def test_opening_rating_and_movers(self):
+        r = engine.opening_rating("A", breakout_stock(), DAILY, nifty(), DT.combine(DAY, datetime.time(9, 31)))
+        self.assertEqual((r["trend"], r["minutes"]), (True, 15))          # 9:15, 9:20, 9:25 complete by 9:31
+        self.assertGreaterEqual(r["rating"], 6)
+        self.assertEqual(r["gap"], 0.17)                                   # opened 300.50 vs 300.00
+        up, down = engine.movers({"A": series([(PREV, "09:15", 0, 0, 0, 300.0, 0)])}, {"A": breakout_stock()},
+                                 DAY, NOW)
+        self.assertEqual((up, down), ([("A", 1.33)], []))
+
+
 class Trades(unittest.TestCase):
     def trade(self, **kw):
         t = journal.new_trade("ACMEAUTO", "buy", 304.0, 300.75, 16, "paper", DT.combine(DAY, datetime.time(9, 41)))
